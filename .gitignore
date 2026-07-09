@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Data and local indexes
+data/raw/
+data/processed/
+data/qdrant/
+*.sqlite3
+*.db
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Node / UI tooling
+node_modules/
+dist/
+.next/
