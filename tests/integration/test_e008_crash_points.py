@@ -24,7 +24,10 @@ from agentic_rag_enterprise.retrieval.hybrid import _HybridSearchAdapter
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
 from agentic_rag_enterprise.security.policy import ResourceAcl
-from agentic_rag_enterprise.storage.metadata_store import MetadataStore
+from agentic_rag_enterprise.storage.metadata_store import (
+    JobIdentityConflict,
+    MetadataStore,
+)
 from agentic_rag_enterprise.storage.parent_store import ParentStore
 from agentic_rag_enterprise.storage.vector_store import VectorStore
 from tests.fixtures import (
@@ -92,7 +95,9 @@ def _build():
         dense_encoder=FakeDenseEncoder(),
         sparse_encoder=FakeSparseEncoder(),
     )
-    retriever = SecureRetriever(_HybridSearchAdapter(vector), ParentReader(parents))
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(vector), ParentReader(parents), metadata_store=store
+    )
     return manager, store, vector, parents, retriever, db_path
 
 
@@ -205,9 +210,10 @@ def test_crash_after_commit_publish_recovers_without_rollback() -> None:
     assert store.get_active_document("t1", "eng", "doc1").version == "v2"
     old = store.get_document("t1", "eng", "doc1", "v1")
     assert old.status.value == "deprecated"
-    # ...but publish failed, so old version is still the only one visible on the
-    # data plane (new version is still 'processing').
-    assert _retrieve_versions(retriever) == ["v1"]
+    # ...but publish failed. Control plane active=v2, so the gate makes the
+    # deprecated v1 invisible; v2 points are present but still 'processing' (no
+    # parent published) and are denied. Result: nothing retrievable.
+    assert _retrieve_versions(retriever) == []
     assert store.get_job_status("j2") == JobStatus.FAILED
 
     # Resume (plain job): publish succeeds, new version becomes visible, old is
@@ -238,5 +244,62 @@ def test_duplicate_job_delivery_is_idempotent() -> None:
     assert vector._client.count("eng").count == points_after_first
     assert len(store.list_chunk_records("t1", "eng", "doc1", "v1")) == chunks_after_first
     assert store.get_job_status("j1") == JobStatus.SUCCEEDED
+    store.close()
+    os.unlink(db_path)
+
+
+def test_older_job_loses_active_version_race() -> None:
+    # P1-3 + gate: an older job that acquired before a newer job committed must
+    # not overwrite the now-active version when it finally commits.
+    manager, store, vector, parents, retriever, db_path = _build()
+    manager.ingest(_request(job_id="j0", version="v1", content=SAMPLE_MARKDOWN))
+    assert _retrieve_versions(retriever) == ["v1"]
+
+    # Job A (v2) acquires at current revision 1, then crashes before commit.
+    IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=_request(job_id="jA", version="v2", content=SAMPLE_MARKDOWN + "\n\n## A\n"),
+    ).run(max_step="verify")
+    # Job B (v3) acquires and commits first.
+    manager.ingest(_request(job_id="jB", version="v3", content=SAMPLE_MARKDOWN + "\n\n## B\n"))
+    assert store.get_active_document("t1", "eng", "doc1").version == "v3"
+    assert _retrieve_versions(retriever) == ["v3"]
+
+    # Job A finally commits using its persisted base_revision (1). Current is 2,
+    # so CAS rejects -> A fails and compensates, leaving v3 active and visible.
+    res_a = IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=_request(job_id="jA", version="v2", content=SAMPLE_MARKDOWN + "\n\n## A\n"),
+    ).run()
+    assert res_a.status == IngestionStatus.FAILED
+    assert res_a.error_code == "active_version_conflict"
+    assert store.get_active_document("t1", "eng", "doc1").version == "v3"
+    assert _retrieve_versions(retriever) == ["v3"]
+    store.close()
+    os.unlink(db_path)
+
+
+def test_job_id_identity_is_immutable() -> None:
+    # P1-6: a job_id bound to (tenant, corpus, document, version) cannot be
+    # reused to ingest a different version.
+    manager, store, vector, parents, retriever, db_path = _build()
+    manager.ingest(_request(job_id="j1", version="v1", content=SAMPLE_MARKDOWN))
+
+    import pytest
+
+    with pytest.raises(JobIdentityConflict):
+        manager.ingest(_request(job_id="j1", version="v2", content=SAMPLE_MARKDOWN))
+    # Original binding unaffected.
+    assert store.get_active_document("t1", "eng", "doc1").version == "v1"
     store.close()
     os.unlink(db_path)

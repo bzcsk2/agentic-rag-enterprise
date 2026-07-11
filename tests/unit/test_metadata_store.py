@@ -5,9 +5,14 @@ import tempfile
 from datetime import datetime, timezone
 
 from agentic_rag_enterprise.domain.document import SourceDocument
-from agentic_rag_enterprise.domain.ingestion import DocumentStatus
+from agentic_rag_enterprise.domain.ingestion import (
+    DocumentStatus,
+    IngestionManifest,
+    JobStatus,
+)
 from agentic_rag_enterprise.storage.metadata_store import (
     ActiveVersionConflict,
+    JobIdentityConflict,
     MetadataStore,
 )
 
@@ -135,7 +140,7 @@ def test_commit_active_version_switches_and_increments_revision() -> None:
     store.upsert_document(_make_doc(version="v1", status=DocumentStatus.PROCESSING))
     store.upsert_document(_make_doc(version="v2", status=DocumentStatus.PROCESSING))
 
-    rev1 = store.commit_active_version(
+    rev1, prev1 = store.commit_active_version(
         tenant_id="t1",
         corpus_id="eng",
         document_id="d1",
@@ -143,10 +148,11 @@ def test_commit_active_version_switches_and_increments_revision() -> None:
         expected_revision=0,
     )
     assert rev1 == 1
+    assert prev1 is None  # no prior active version
     assert store.get_active_document("t1", "eng", "d1").version == "v1"
     assert store.get_current_revision("t1", "eng", "d1") == 1
 
-    rev2 = store.commit_active_version(
+    rev2, prev2 = store.commit_active_version(
         tenant_id="t1",
         corpus_id="eng",
         document_id="d1",
@@ -154,6 +160,7 @@ def test_commit_active_version_switches_and_increments_revision() -> None:
         expected_revision=1,
     )
     assert rev2 == 2
+    assert prev2 == "v1"  # the version actually replaced
     active = store.get_active_document("t1", "eng", "d1")
     assert active.version == "v2"
     # Old version is superseded (deprecated + non-active), not retrieved.
@@ -191,7 +198,7 @@ def test_commit_active_version_rejects_stale_revision() -> None:
             expected_revision=0,
         )
     # But the correct revision proceeds.
-    rev = store.commit_active_version(
+    rev, _ = store.commit_active_version(
         tenant_id="t1",
         corpus_id="eng",
         document_id="d1",
@@ -219,6 +226,7 @@ def test_step_markers_are_reentrant() -> None:
         chunking_version="1.0",
         embedding_version="1.0",
         raw_hash="abc",
+        base_revision=0,
     )
     # acquire_job already marks the "acquire" step.
     assert store.is_step_done("job-1", "acquire")
@@ -229,5 +237,116 @@ def test_step_markers_are_reentrant() -> None:
     # Re-marking is idempotent.
     store.mark_step("job-1", "acquire", "done")
     assert store.list_done_steps("job-1") == ["acquire", "write_qdrant"]
+    store.close()
+    os.unlink(path)
+
+
+def test_current_revision_is_monotonic_over_all_versions() -> None:
+    # After the active version is deprecated (no active row), the revision must
+    # still reflect the maximum ever seen, not fall back to 0 (build plan
+    # §10.10 #8, E-008.1 P1-3).
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.PROCESSING))
+    store.upsert_document(_make_doc(version="v2", status=DocumentStatus.PROCESSING))
+    store.commit_active_version(
+        tenant_id="t1",
+        corpus_id="eng",
+        document_id="d1",
+        new_version="v1",
+        expected_revision=0,
+    )
+    store.commit_active_version(
+        tenant_id="t1",
+        corpus_id="eng",
+        document_id="d1",
+        new_version="v2",
+        expected_revision=1,
+    )
+    assert store.get_active_document("t1", "eng", "d1").version == "v2"
+    assert store.get_current_revision("t1", "eng", "d1") == 2
+    store.close()
+    os.unlink(path)
+
+
+def test_job_identity_is_immutable() -> None:
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(status=DocumentStatus.PROCESSING))
+    store.acquire_job(
+        job_id="j1",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+    )
+    # Same identity -> ok.
+    store.validate_job_identity(
+        job_id="j1",
+        tenant_id="t1",
+        corpus_id="eng",
+        document_id="d1",
+        document_version="v1",
+        raw_hash="abc",
+    )
+    # Different version bound to same job_id -> conflict (E-008.1 P1-6).
+    import pytest
+
+    with pytest.raises(JobIdentityConflict):
+        store.validate_job_identity(
+            job_id="j1",
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="d1",
+            document_version="v2",
+            raw_hash="abc",
+        )
+    store.close()
+    os.unlink(path)
+
+
+def test_job_manifest_is_persisted() -> None:
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(status=DocumentStatus.PROCESSING))
+    store.acquire_job(
+        job_id="j1",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+        raw_hash="abc",
+        base_revision=0,
+    )
+    manifest = IngestionManifest(
+        job_id="j1",
+        document_id="d1",
+        document_version="v1",
+        corpus_id="eng",
+        tenant_id="t1",
+        status=JobStatus.SUCCEEDED,
+        started_at=_FIXED,
+        raw_hash="abc",
+        parent_count=2,
+        child_count=5,
+        parser_version="1.0",
+        chunking_version="1.0",
+        embedding_version="1.0",
+    )
+    store.set_job_manifest("j1", manifest.model_dump_json())
+    row = store._conn.execute("SELECT manifest FROM ingestion_jobs WHERE job_id='j1'").fetchone()
+    assert row["manifest"]
+    assert IngestionManifest.model_validate_json(row["manifest"]).job_id == "j1"
     store.close()
     os.unlink(path)

@@ -8,6 +8,7 @@
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
+- Issue: **E-008.1** — Audit-remediation of E-008 (7 MUST violations) — CLOSED at this commit; full contract at `docs/issue-e0081-contract.md`.
 - Prior issue **E-006.1** — CLOSED at `807aa0c` (deprecated flag in PEP, real cross-tenant tests, Qdrant PDP/PEP equivalence).
 
 > **AGENTS.md is a slim entry point** (build plan §1.7): current Milestone/Issue, fixed
@@ -196,6 +197,52 @@ allowed/forbidden paths, §10.10 cross-store rules, crash-point plan) is version
 - No second ingestion runtime; extend the E-007 ported chain.
 - No Planner / Evidence Store / multi-corpus / reranker (later milestones).
 - No logical delete / ACL-tightening (E-010); lifecycle + `lifecycle_revision` mechanism only.
+
+## E-008.1 Issue Contract (M1 only) — CLOSED at this commit
+Audit-remediation of E-008 (verdict **Conditional Fail**). Baseline `139df74` + `a3ec258` kept
+intact; E-008.1 is a narrow fix commit. Scope is a strict subset of the E-008 allowed paths
+(`storage/`, `ingestion/`, `retrieval/`, `tests/...`, `migrations/`, `AGENTS.md`,
+`docs/issue-e0081-contract.md`); no upstream modifications, no `config.py`/`domain/` changes.
+
+### P1 fixes (all done)
+- **P1-1 — Control-plane active-version gate.** `SecureRetriever` accepts an optional
+  `metadata_store`; retrieval drops every hit whose `document_version` is not the Metadata DB's
+  current active version for that document (build plan §10.10 #5). E2E + crash-point tests assert a
+  deprecated-but-not-deleted version cannot reach the model.
+- **P1-2 — Idempotency by `(document, version, content_hash)`, not `job_id`.** Same artifact with a
+  different `job_id` returns `ALREADY_INDEXED` (no rework, no active-row flip); same version with
+  different content raises `VersionContentConflict` (never overwrites).
+- **P1-3 — `base_revision` persisted at acquire; monotonic `MAX(lifecycle_revision)`.**
+  `acquire_job` persists the revision captured at acquire; `commit_active_version` CASes against it
+  and increments from `MAX(lifecycle_revision)` over ALL versions, so a newer committed version
+  wins and old jobs fail closed with `ActiveVersionConflict`.
+- **P1-4 — `verify` step before commit.** `run()` adds a `verify` step that confirms expected
+  Parent/Qdrant Point IDs exist, identity is consistent, counts match, and the new version is still
+  uncommitted (or is our own already-active version on a resumed run).
+- **P1-5 — Unified, idempotent compensation.** Pre-commit failure deletes THIS version's data-plane
+  artifacts + control-plane chunk records, clears step markers (so a failed job fully re-runs), and
+  marks the processing row failed; post-commit publish failure leaves the control-plane active
+  version and resumes to publish (never rolls back the active version).
+- **P1-6 — `job_id` is an immutable binding.** `validate_job_identity` rejects reuse of a `job_id`
+  for a different `(tenant, corpus, document, version)` with `JobIdentityConflict` before any row
+  is mutated.
+- **P1-7 — Publish deprecates ONLY the version actually replaced.** `previous_active_version` is
+  captured at acquire (stable across resume) and persisted; `publish` promotes this version's
+  points/parents to `active` and deprecates only that one prior version (never scans all
+  non-active rows, never disturbs a concurrent still-processing version).
+
+### Migration
+- `migrations/003_e0081_job_metadata.sql` — NEW; `ingestion_jobs.base_revision`,
+  `previous_active_version`, `manifest`. `apply_migrations` embeds the marker in the DDL script so
+  the schema change and its record commit together (no duplicate-column on next boot).
+
+### Acceptance tests
+- `tests/unit/test_metadata_store.py` — monotonic revision, job identity, manifest persisted.
+- `tests/unit/test_ingestion_job.py` — content idempotency, base_revision CAS, verify, compensation.
+- `tests/integration/test_e008_ingestion_e2e.py` — active-version gate; no stale version leaks.
+- `tests/integration/test_e008_crash_points.py` — older job loses race, job identity immutable.
+- `tests/baseline/` MUST remain green.
+- `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` all green.
 
 ## Standard Checks
 ```bash

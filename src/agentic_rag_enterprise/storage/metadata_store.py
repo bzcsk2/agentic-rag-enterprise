@@ -62,6 +62,31 @@ class ActiveVersionConflict(Exception):
         super().__init__(reason)
 
 
+class JobIdentityConflict(Exception):
+    """Raised when a ``job_id`` is reused with a different immutable request.
+
+    A ``job_id`` is an immutable binding to (tenant, corpus, document, version,
+    raw_hash). Reusing it for a different artifact must fail closed before any
+    document row is mutated (build plan §10.10 #2, E-008.1 P1-6).
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class VersionContentConflict(Exception):
+    """Raised when the same ``(document_id, version)`` is re-ingested with a
+    different ``content_hash``.
+
+    The existing version must not be overwritten (build plan §10.4, E-008.1 P1-2).
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class MetadataStore:
     """SQLite-backed metadata store for documents, jobs, chunks and steps."""
 
@@ -88,11 +113,18 @@ class MetadataStore:
             version = path.stem
             if version in applied:
                 continue
-            self._conn.executescript(path.read_text())
-            self._conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (version, _now_iso()),
+            # Append the migration marker to the DDL script so the schema change
+            # and its record commit together (executescript autocommits the whole
+            # script). A crash between DDL and marker thus cannot leave a column
+            # added but unrecorded, which would otherwise fail on the next boot
+            # with a duplicate-column error.
+            cur = self._conn.cursor()
+            script = (
+                path.read_text()
+                + "\nINSERT INTO schema_migrations(version, applied_at) "
+                + f"VALUES ('{version}', '{_now_iso()}');\n"
             )
+            cur.executescript(script)
             applied.add(version)
 
     def close(self) -> None:
@@ -113,8 +145,14 @@ class MetadataStore:
         chunking_version: str,
         embedding_version: str,
         raw_hash: str,
+        base_revision: int,
     ) -> JobStatus:
-        """Insert the job row if absent (CAS via PK). Returns the current status."""
+        """Insert the job row if absent (CAS via PK). Returns the current status.
+
+        ``base_revision`` is the monotonic lifecycle revision captured at acquire
+        time and persisted so the commit-phase CAS rejects this job if a newer
+        revision lands first (build plan §10.10 #8, E-008.1 P1-3).
+        """
         row = self._conn.execute(
             "SELECT status FROM ingestion_jobs WHERE job_id = ?", (job_id,)
         ).fetchone()
@@ -125,8 +163,8 @@ class MetadataStore:
             INSERT INTO ingestion_jobs (
                 job_id, document_id, document_version, corpus_id, tenant_id,
                 status, started_at, raw_hash, parent_count, child_count,
-                parser_version, chunking_version, embedding_version
-            ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0, 0, ?, ?, ?)
+                parser_version, chunking_version, embedding_version, base_revision
+            ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 0, 0, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -139,10 +177,71 @@ class MetadataStore:
                 parser_version,
                 chunking_version,
                 embedding_version,
+                base_revision,
             ),
         )
         self.mark_step(job_id, "acquire", "done")
         return JobStatus.RUNNING
+
+    def validate_job_identity(
+        self,
+        *,
+        job_id: str,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        document_version: str,
+        raw_hash: str,
+    ) -> None:
+        """Fail closed if ``job_id`` is reused with a different immutable request.
+
+        Must run before any document row is mutated (E-008.1 P1-6).
+        """
+        row = self._conn.execute(
+            "SELECT tenant_id, corpus_id, document_id, document_version, raw_hash "
+            "FROM ingestion_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return
+        mismatched = (
+            row["tenant_id"] != tenant_id
+            or row["corpus_id"] != corpus_id
+            or row["document_id"] != document_id
+            or row["document_version"] != document_version
+            or (row["raw_hash"] or "") != raw_hash
+        )
+        if mismatched:
+            raise JobIdentityConflict(
+                f"job_id={job_id!r} already bound to a different request "
+                f"(tenant={row['tenant_id']!r} corpus={row['corpus_id']!r} "
+                f"doc={row['document_id']!r} version={row['document_version']!r})"
+            )
+
+    def get_job_base_revision(self, job_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT base_revision FROM ingestion_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return int(row["base_revision"]) if row else 0
+
+    def get_job_previous_version(self, job_id: str) -> Optional[str]:
+        row = self._conn.execute(
+            "SELECT previous_active_version FROM ingestion_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return row["previous_active_version"] if row else None
+
+    def set_job_previous_version(self, job_id: str, version: Optional[str]) -> None:
+        self._conn.execute(
+            "UPDATE ingestion_jobs SET previous_active_version = ? WHERE job_id = ?",
+            (version, job_id),
+        )
+
+    def set_job_manifest(self, job_id: str, manifest_json: str) -> None:
+        self._conn.execute(
+            "UPDATE ingestion_jobs SET manifest = ? WHERE job_id = ?",
+            (manifest_json, job_id),
+        )
 
     def get_job_status(self, job_id: str) -> Optional[JobStatus]:
         row = self._conn.execute(
@@ -208,6 +307,12 @@ class MetadataStore:
             )
         ]
 
+    def clear_steps(self, job_id: str) -> None:
+        # Drop step markers so a compensated (failed) job re-runs the full
+        # pipeline from scratch on resume, rather than skipping a step whose
+        # data-plane artifact was deleted by compensation (build plan §10.10 #7).
+        self._conn.execute("DELETE FROM job_steps WHERE job_id = ?", (job_id,))
+
     # ------------------------------------------------------------------ #
     # Documents
     # ------------------------------------------------------------------ #
@@ -253,13 +358,29 @@ class MetadataStore:
         ).fetchone()
         return self._row_to_document(row) if row else None
 
-    def get_current_revision(self, tenant_id: str, corpus_id: str, document_id: str) -> int:
+    def get_active_version(self, tenant_id: str, corpus_id: str, document_id: str) -> Optional[str]:
+        """Control-plane active version for a document (build plan §10.10 #5).
+
+        Retrieval gates on this so a freshly-committed active version is the only
+        one that may reach the model, regardless of data-plane cleanup lag.
+        """
         row = self._conn.execute(
-            "SELECT lifecycle_revision FROM documents "
+            "SELECT version FROM documents "
             "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND status='active'",
             (tenant_id, corpus_id, document_id),
         ).fetchone()
-        return int(row["lifecycle_revision"]) if row else 0
+        return row["version"] if row else None
+
+    def get_current_revision(self, tenant_id: str, corpus_id: str, document_id: str) -> int:
+        # Monotonic over ALL versions of the document (not just the active row),
+        # so delete/update competition is still ordered when no active row exists
+        # (build plan §10.10 #8, E-008.1 P1-3).
+        row = self._conn.execute(
+            "SELECT MAX(lifecycle_revision) AS m FROM documents "
+            "WHERE tenant_id=? AND corpus_id=? AND document_id=?",
+            (tenant_id, corpus_id, document_id),
+        ).fetchone()
+        return int(row["m"]) if row and row["m"] is not None else 0
 
     def get_superseded_versions(
         self, tenant_id: str, corpus_id: str, document_id: str, *, exclude_version: str
@@ -280,17 +401,20 @@ class MetadataStore:
         document_id: str,
         new_version: str,
         expected_revision: int,
-    ) -> int:
+    ) -> tuple[int, Optional[str]]:
         """Atomically switch the active version within one transaction.
 
-        * increments ``lifecycle_revision`` monotonically,
-        * deactivates the prior active version (status -> superseded),
+        * increments ``lifecycle_revision`` monotonically (over ALL versions),
+        * deactivates the prior active version (status -> deprecated),
         * activates ``new_version`` (status -> active, indexed_at set),
         * uses CAS on ``lifecycle_revision`` so a stale/competing job fails
           closed (build plan §10.10 #2, #4, #8).
 
-        Returns the new ``lifecycle_revision``. Raises :class:`ActiveVersionConflict`
-        if the race is lost or ``expected_revision`` is stale.
+        Returns ``(new_lifecycle_revision, previous_active_version)``. Raises
+        :class:`ActiveVersionConflict` if the race is lost or ``expected_revision``
+        is stale. ``previous_active_version`` is ``None`` when there was no prior
+        active version; the caller persists it so ``publish`` only deprecates the
+        version this transaction actually replaced (E-008.1 P1-7).
         """
         # ``BEGIN IMMEDIATE`` takes a RESERVED write lock up front, so only one
         # writer can be in this transaction at a time; sqlite does not support
@@ -300,29 +424,36 @@ class MetadataStore:
         cur = self._conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
-            row = cur.execute(
-                "SELECT version, lifecycle_revision FROM documents "
-                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND status='active'",
+            # Monotonic revision is taken over ALL versions, not just the active
+            # row, so competition ordering survives a deleted/no-active state.
+            rev_row = cur.execute(
+                "SELECT MAX(lifecycle_revision) AS m FROM documents "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=?",
                 (tenant_id, corpus_id, document_id),
             ).fetchone()
-            current_rev = int(row["lifecycle_revision"]) if row else 0
-            if row is not None and current_rev != expected_revision:
+            current_rev = int(rev_row["m"]) if rev_row and rev_row["m"] is not None else 0
+            if current_rev != expected_revision:
                 raise ActiveVersionConflict(
                     f"stale expected_revision={expected_revision}, current={current_rev}"
                 )
             new_rev = current_rev + 1
             now = _now_iso()
-            # The previously-active version is superseded: it MUST leave the
-            # "active" state so retrieval (status=active & deprecated=false)
-            # never serves a stale version. "deprecated" is the only
-            # non-active lifecycle state in the schema/enum that also reads as
-            # not-retrievable (§10.2 active->deprecated transition).
-            if row is not None and row["version"] != new_version:
+            # Find the currently active version (if any) to replace.
+            active_row = cur.execute(
+                "SELECT version FROM documents "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND status='active'",
+                (tenant_id, corpus_id, document_id),
+            ).fetchone()
+            previous_version = active_row["version"] if active_row else None
+            # The previously-active version MUST leave the "active" state so
+            # retrieval (status=active & deprecated=false, plus the control-plane
+            # active-version gate) never serves a stale version.
+            if previous_version is not None and previous_version != new_version:
                 cur.execute(
                     "UPDATE documents SET status='deprecated', deprecated=1, "
                     "effective_to=?, lifecycle_revision=? WHERE tenant_id=? AND "
                     "corpus_id=? AND document_id=? AND version=?",
-                    (now, new_rev, tenant_id, corpus_id, document_id, row["version"]),
+                    (now, new_rev, tenant_id, corpus_id, document_id, previous_version),
                 )
             cur.execute(
                 "UPDATE documents SET status='active', deprecated=0, "
@@ -335,7 +466,7 @@ class MetadataStore:
                     f"new version {new_version} not found or already superseded"
                 )
             cur.execute("COMMIT")
-            return new_rev
+            return new_rev, previous_version
         except Exception:
             cur.execute("ROLLBACK")
             raise
@@ -365,6 +496,32 @@ class MetadataStore:
             (tenant_id, corpus_id, document_id, document_version),
         ).fetchall()
         return [self._row_to_chunk(r) for r in rows]
+
+    def delete_chunk_records(
+        self, tenant_id: str, corpus_id: str, document_id: str, document_version: str
+    ) -> None:
+        """Remove this version's control-plane chunk records (compensation)."""
+        self._conn.execute(
+            "DELETE FROM chunks WHERE tenant_id=? AND corpus_id=? AND document_id=? "
+            "AND document_version=?",
+            (tenant_id, corpus_id, document_id, document_version),
+        )
+
+    def mark_document_failed(
+        self, tenant_id: str, corpus_id: str, document_id: str, document_version: str
+    ) -> None:
+        """On pre-commit failure, mark this version's row failed (not active).
+
+        Only transitions a still-unactivated row (processing/failed); never
+        touches an active row, so a failed concurrent job cannot deactivate the
+        currently visible version (build plan §10.5, E-008.1 P1-5).
+        """
+        self._conn.execute(
+            "UPDATE documents SET status='failed', deprecated=0 "
+            "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=? "
+            "AND status IN ('processing', 'failed')",
+            (tenant_id, corpus_id, document_id, document_version),
+        )
 
     # ------------------------------------------------------------------ #
     # Row <-> model mapping

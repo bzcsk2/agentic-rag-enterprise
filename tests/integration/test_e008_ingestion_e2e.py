@@ -88,7 +88,9 @@ def _build() -> tuple[
         dense_encoder=FakeDenseEncoder(),
         sparse_encoder=FakeSparseEncoder(),
     )
-    retriever = SecureRetriever(_HybridSearchAdapter(vector), ParentReader(parents))
+    retriever = SecureRetriever(
+        _HybridSearchAdapter(vector), ParentReader(parents), metadata_store=store
+    )
     return manager, store, vector, parents, retriever, db_path
 
 
@@ -196,5 +198,29 @@ def test_tenant_binding_is_enforced_on_retrieval() -> None:
         sparse_encoder=FakeSparseEncoder(),
     )
     assert result.hits == []
+    store.close()
+    os.unlink(db_path)
+
+
+def test_control_plane_active_version_gate_filters_inactive_points() -> None:
+    # P1-1: a query whose terms appear in BOTH v1 and v2 must return only the
+    # ACTIVE version's hits. v1 points are physically retained (deprecated, not
+    # deleted), so only the control-plane gate keeps them out of results.
+    manager, store, vector, parents, retriever, db_path = _build()
+    manager.ingest(_request(job_id="j1", version="v1", content=SAMPLE_MARKDOWN))
+    manager.ingest(_request(job_id="j2", version="v2", content=SAMPLE_MARKDOWN))
+    assert store.get_active_document("t1", "eng", "doc1").version == "v2"
+    # Both versions physically present in the vector store.
+    assert vector._client.count("eng").count > 0
+
+    result = retriever.retrieve(
+        make_security_context(),
+        "architecture planner security",  # token present in both versions
+        _corpus(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+    )
+    assert result.hits
+    assert all(p.document_version == "v2" for _, p in result.hits)
     store.close()
     os.unlink(db_path)

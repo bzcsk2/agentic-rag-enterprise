@@ -18,7 +18,10 @@ from agentic_rag_enterprise.ingestion.job import (
     IngestionStatus,
 )
 from agentic_rag_enterprise.security.policy import ResourceAcl
-from agentic_rag_enterprise.storage.metadata_store import MetadataStore
+from agentic_rag_enterprise.storage.metadata_store import (
+    MetadataStore,
+    VersionContentConflict,
+)
 from agentic_rag_enterprise.storage.parent_store import ParentStore
 from agentic_rag_enterprise.storage.vector_store import VectorStore
 from tests.fixtures import DENSE_DIM, FakeDenseEncoder, FakeSparseEncoder, acl_payload
@@ -136,7 +139,7 @@ def test_step_reentrancy_resumes_after_crash() -> None:
         sparse_encoder=FakeSparseEncoder(),
         request=req,
     ).run(max_step="write_parents")
-    assert partial.status == IngestionStatus.INDEXED  # steps up to write_parents done
+    assert partial.status == IngestionStatus.IN_PROGRESS  # crashed before completion
     # New version not yet visible (no qdrant points / not committed).
     assert store.get_active_document("t1", "eng", "d1") is None
 
@@ -196,5 +199,108 @@ def test_active_version_conflict_fails_closed() -> None:
             expected_revision=0,
         )
     assert store.get_active_document("t1", "eng", "d1").version == "v1"
+    store.close()
+    os.unlink(db_path)
+
+
+def test_idempotency_is_keyed_on_document_version_not_job_id() -> None:
+    # P1-2: same (document, version) + same content -> ALREADY_INDEXED even with
+    # a DIFFERENT job_id, and must NOT flip the active row back to processing.
+    manager, store, vector, parents, db_path = _manager()
+    first = manager.ingest(_request(job_id="j1", version="v1", content="# T\n\nhello world"))
+    assert first.status == IngestionStatus.INDEXED
+
+    second = manager.ingest(_request(job_id="j2", version="v1", content="# T\n\nhello world"))
+    assert second.status == IngestionStatus.ALREADY_INDEXED
+    active = store.get_active_document("t1", "eng", "d1")
+    assert active is not None
+    assert active.status == DocumentStatus.ACTIVE
+    assert active.version == "v1"
+    store.close()
+    os.unlink(db_path)
+
+
+def test_same_version_different_content_is_rejected() -> None:
+    # P1-2: re-ingesting an existing version with different content must not
+    # overwrite the prior version.
+    manager, store, vector, parents, db_path = _manager()
+    manager.ingest(_request(job_id="j1", version="v1", content="# T\n\nfirst content"))
+    import pytest
+
+    with pytest.raises(VersionContentConflict):
+        manager.ingest(_request(job_id="j2", version="v1", content="# T\n\nchanged content"))
+    # Original version untouched and still active.
+    assert store.get_active_document("t1", "eng", "d1").version == "v1"
+    store.close()
+    os.unlink(db_path)
+
+
+def test_old_job_cannot_override_newer_committed_version() -> None:
+    # P1-3: an older job (acquired at revision 1, then interrupted before
+    # commit) must lose the race to a newer job that committed first.
+    manager, store, vector, parents, db_path = _manager()
+    manager.ingest(_request(job_id="j0", version="v1", content="# T\n\nv1 content"))
+    # Job A (v2) acquires at current revision 1, then is interrupted before commit.
+    IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=_request(job_id="jA", version="v2", content="# T\n\nv2 content"),
+    ).run(max_step="verify")
+    # Job B (v3) acquires at revision 1 and commits first -> active v3, rev 2.
+    manager.ingest(_request(job_id="jB", version="v3", content="# T\n\nv3 content"))
+    assert store.get_active_document("t1", "eng", "d1").version == "v3"
+
+    # Job A finally commits using its PERSISTED base_revision (1). Current is 2,
+    # so CAS rejects it; A fails and compensates, leaving v3 active.
+    res_a = IngestionJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=_request(job_id="jA", version="v2", content="# T\n\nv2 content"),
+    ).run()
+    assert res_a.status == IngestionStatus.FAILED
+    assert res_a.error_code == "active_version_conflict"
+    assert store.get_active_document("t1", "eng", "d1").version == "v3"
+    store.close()
+    os.unlink(db_path)
+
+
+def test_compensation_cleans_control_plane_when_verify_fails() -> None:
+    # P1-5: a pre-commit failure after data-plane writes must also remove the
+    # control-plane chunk records and mark the processing row failed (not
+    # relying on in-memory state).
+    manager, store, vector, parents, db_path = _manager()
+
+    class VerifyFailingJob(IngestionJob):
+        def _step_verify(self) -> None:
+            raise RuntimeError("simulated verification failure")
+
+    req = _request(job_id="j1", version="v1", content="# T\n\nhello world")
+    failing = VerifyFailingJob(
+        store=store,
+        vector_store=vector,
+        parent_store=parents,
+        chunker=ParentChildChunker(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
+        request=req,
+    )
+    res = failing.run()
+    assert res.status == IngestionStatus.FAILED
+    # Control plane cleaned.
+    assert store.list_chunk_records("t1", "eng", "d1", "v1") == []
+    doc = store.get_document("t1", "eng", "d1", "v1")
+    assert doc is not None
+    assert doc.status == DocumentStatus.FAILED
+    # Data plane cleaned too.
+    assert len(parents._store) == 0
+    assert _count_qdrant_points(vector, "eng") == 0
     store.close()
     os.unlink(db_path)

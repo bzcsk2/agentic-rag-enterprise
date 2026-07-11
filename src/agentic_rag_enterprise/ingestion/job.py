@@ -21,10 +21,18 @@ from typing import Optional
 
 from agentic_rag_enterprise.domain.chunk import ChunkRecord
 from agentic_rag_enterprise.domain.document import SourceDocument
-from agentic_rag_enterprise.domain.ingestion import DocumentStatus, JobStatus
+from agentic_rag_enterprise.domain.ingestion import (
+    DocumentStatus,
+    IngestionManifest,
+    JobStatus,
+)
 from agentic_rag_enterprise.ingestion.chunker import ChildChunk, ParentChildChunker, ParentChunk
 from agentic_rag_enterprise.security.policy import ResourceAcl
-from agentic_rag_enterprise.storage.metadata_store import ActiveVersionConflict, MetadataStore
+from agentic_rag_enterprise.storage.metadata_store import (
+    ActiveVersionConflict,
+    MetadataStore,
+    VersionContentConflict,
+)
 from agentic_rag_enterprise.storage.parent_store import ParentStore
 from agentic_rag_enterprise.storage.vector_store import (
     DenseEncoder,
@@ -46,6 +54,7 @@ def _now() -> datetime:
 class IngestionStatus(str, Enum):
     INDEXED = "indexed"
     ALREADY_INDEXED = "already_indexed"
+    IN_PROGRESS = "in_progress"
     FAILED = "failed"
 
 
@@ -97,6 +106,7 @@ class IngestionJob:
         "chunk",
         "write_parents",
         "write_qdrant",
+        "verify",
         "commit",
         "publish",
         "finalize",
@@ -143,32 +153,59 @@ class IngestionJob:
         a subsequent ``run()`` resumes from the last completed step marker.
         """
         steps = self.STEPS
+        stopped_early = False
         if max_step is not None:
             if max_step not in steps:
                 raise ValueError(f"unknown step: {max_step}")
+            if max_step != steps[-1]:
+                stopped_early = True
             steps = steps[: steps.index(max_step) + 1]
 
-        # Idempotency guard: if THIS job already succeeded for an active
-        # version, return ALREADY_INDEXED without rework. A job that committed
-        # but has not finalized (crashed between commit and finalize) is NOT
-        # "succeeded", so a resume re-runs publish + finalize (build plan
-        # §10.10 #3, #6, #7).
+        # Hash the content up front; it drives identity and idempotency.
+        self._raw_hash = _sha256(self._req.content)
+
+        # P1-6: a job_id is an immutable binding. Reject reuse with a different
+        # request BEFORE any document row is mutated.
+        self._store.validate_job_identity(
+            job_id=self._req.job_id,
+            tenant_id=self._req.tenant_id,
+            corpus_id=self._req.corpus_id,
+            document_id=self._req.document_id,
+            document_version=self._req.document_version,
+            raw_hash=self._raw_hash,
+        )
+
+        # P1-2: idempotency keyed on (document, version, content_hash), NOT on
+        # job_id. Same artifact already known -> ALREADY_INDEXED (no rework,
+        # no overwrite of the active row, no data-plane rewrite). Same version
+        # with different content -> VersionContentConflict (never overwrite).
         existing = self._store.get_document(
             self._req.tenant_id,
             self._req.corpus_id,
             self._req.document_id,
             self._req.document_version,
         )
-        if (
-            existing is not None
-            and existing.status == DocumentStatus.ACTIVE
-            and self._store.get_job_status(self._req.job_id) == JobStatus.SUCCEEDED
-        ):
-            return IngestionResult(
-                status=IngestionStatus.ALREADY_INDEXED,
-                job_id=self._req.job_id,
-                document_version=self._req.document_version,
-            )
+        if existing is not None:
+            if existing.content_hash != self._raw_hash:
+                raise VersionContentConflict(
+                    f"version {self._req.document_version!r} already ingested with a "
+                    f"different content_hash; refusing to overwrite"
+                )
+            if existing.status == DocumentStatus.ACTIVE:
+                # A published version is done. Re-run ONLY when this exact job
+                # previously FAILED after committing (active in the control plane
+                # but unpublished on the data plane); otherwise it is idempotent
+                # ALREADY_INDEXED regardless of which job delivers it (build plan
+                # §10.10, E-008.1 P1-2/P1-5).
+                if self._store.get_job_status(self._req.job_id) != JobStatus.FAILED:
+                    self._store.mark_job_terminal(self._req.job_id, JobStatus.SUCCEEDED)
+                    return IngestionResult(
+                        status=IngestionStatus.ALREADY_INDEXED,
+                        job_id=self._req.job_id,
+                        document_version=self._req.document_version,
+                    )
+            # processing/failed same-content re-delivery (or active-but-unpublished
+            # resume): fall through and run rather than clobbering active state.
 
         try:
             for step in steps:
@@ -177,6 +214,12 @@ class IngestionJob:
                 getattr(self, f"_step_{step}")()
                 self._store.mark_step(self._req.job_id, step, "done")
 
+            if stopped_early:
+                return IngestionResult(
+                    status=IngestionStatus.IN_PROGRESS,
+                    job_id=self._req.job_id,
+                    document_version=self._req.document_version,
+                )
             return IngestionResult(
                 status=IngestionStatus.INDEXED,
                 job_id=self._req.job_id,
@@ -184,34 +227,32 @@ class IngestionJob:
                 parent_count=len(self._parents_list),
                 child_count=len(self._children_list),
             )
-        except ActiveVersionConflict as exc:
-            self._store.mark_job_terminal(
-                self._req.job_id,
-                JobStatus.FAILED,
-                error_code="active_version_conflict",
-                error_message=str(exc),
-            )
-            return IngestionResult(
-                status=IngestionStatus.FAILED,
-                job_id=self._req.job_id,
-                document_version=self._req.document_version,
-                error_code="active_version_conflict",
-                error_message=str(exc),
-            )
         except Exception as exc:  # noqa: BLE001 — fail closed + compensate
+            # P1-5: every pre-commit failure path (including ActiveVersionConflict)
+            # routes through the same idempotent compensation and leaves a failed
+            # record. Never deactivates the currently visible active version.
+            error_code = (
+                "active_version_conflict"
+                if isinstance(exc, ActiveVersionConflict)
+                else "ingestion_error"
+            )
             if not self._store.is_step_done(self._req.job_id, "commit"):
                 self._compensate()
+            else:
+                # Committed but later step failed: the new version is already
+                # visible; do NOT roll it back (build plan §10.10 #6).
+                self._store.set_job_previous_version(self._req.job_id, None)
             self._store.mark_job_terminal(
                 self._req.job_id,
                 JobStatus.FAILED,
-                error_code="ingestion_error",
+                error_code=error_code,
                 error_message=str(exc),
             )
             return IngestionResult(
                 status=IngestionStatus.FAILED,
                 job_id=self._req.job_id,
                 document_version=self._req.document_version,
-                error_code="ingestion_error",
+                error_code=error_code,
                 error_message=str(exc),
             )
 
@@ -221,9 +262,14 @@ class IngestionJob:
     def _step_acquire(self) -> None:
         # Create the document control-plane row FIRST so the ingestion_jobs FK
         # (document_id, tenant_id, corpus_id, document_version) is satisfied.
-        self._raw_hash = _sha256(self._req.content)
         self._source_doc = self._build_source_document(status=DocumentStatus.PROCESSING)
         self._store.upsert_document(self._source_doc)
+        # P1-3: capture and persist the monotonic lifecycle revision at acquire
+        # time. The commit phase CASes against THIS value, so a newer revision
+        # landing first makes this (older) job lose the race.
+        base_revision = self._store.get_current_revision(
+            self._req.tenant_id, self._req.corpus_id, self._req.document_id
+        )
         self._store.acquire_job(
             job_id=self._req.job_id,
             document_id=self._req.document_id,
@@ -234,7 +280,21 @@ class IngestionJob:
             chunking_version=self._req.chunking_version,
             embedding_version=self._req.embedding_version,
             raw_hash=self._raw_hash,
+            base_revision=base_revision,
         )
+        # P1-7: capture the version this job is intended to replace. This is
+        # sampled at acquire time and persisted, so a resumed job (after commit
+        # but before publish) still deprecates the ORIGINAL previous version and
+        # never the version it already committed. acquire_job is an
+        # INSERT OR REPLACE, so restore any previously captured value.
+        existing_previous = self._store.get_job_previous_version(self._req.job_id)
+        if existing_previous is None:
+            previous = self._store.get_active_version(
+                self._req.tenant_id, self._req.corpus_id, self._req.document_id
+            )
+        else:
+            previous = existing_previous
+        self._store.set_job_previous_version(self._req.job_id, previous)
 
     def _step_parse(self) -> None:
         # Content already hashed in acquire; parsed_hash is refined after chunking.
@@ -323,17 +383,91 @@ class IngestionJob:
             )
 
     def _step_commit(self) -> None:
-        expected_rev = self._store.get_current_revision(
-            self._req.tenant_id, self._req.corpus_id, self._req.document_id
-        )
-        # Set indexed_at on the new row now (commit activates it).
-        self._store.commit_active_version(
+        # P1-3: commit against the revision captured at acquire time, not the
+        # latest value read just before commit (which would let an older job
+        # overwrite a newer committed state).
+        expected_rev = self._store.get_job_base_revision(self._req.job_id)
+        new_rev, previous_version = self._store.commit_active_version(
             tenant_id=self._req.tenant_id,
             corpus_id=self._req.corpus_id,
             document_id=self._req.document_id,
             new_version=self._req.document_version,
             expected_revision=expected_rev,
         )
+        # The version this job replaces is captured at acquire time (stable
+        # across resume); commit_active_version's returned previous is only the
+        # current active version and may be the job's own version on resume, so
+        # it must NOT overwrite the persisted acquire-time value.
+
+    def _step_verify(self) -> None:
+        """Verify data-plane completeness before the active-version switch.
+
+        Build plan §10.10 #4: the data plane must be fully written AND verified
+        before commit. Confirms expected Parent IDs and Qdrant Point IDs exist,
+        identity (tenant/corpus/document/version/parent) is consistent, counts
+        match the chunker output, and the new version is still uncommitted.
+        """
+        self._ensure_chunked()
+        collection = self._req.corpus_id
+
+        # All expected parents present in the Parent Store.
+        for parent in self._parents_list:
+            if parent.parent_id not in self._parents:
+                raise RuntimeError(
+                    f"verify failed: parent {parent.parent_id} missing from Parent Store"
+                )
+
+        # All expected Qdrant points exist (status-agnostic existence check).
+        point_ids = [child_point_id(c.child_id) for c in self._children_list]
+        if point_ids:
+            found = self._vector._client.retrieve(
+                collection_name=collection, ids=point_ids, with_payload=False
+            )
+            found_ids = {str(p.id) for p in found}
+            missing = [pid for pid in point_ids if pid not in found_ids]
+            if missing:
+                raise RuntimeError(f"verify failed: {len(missing)} Qdrant point(s) missing")
+
+        # Identity + count consistency against persisted chunk records.
+        stored = self._store.list_chunk_records(
+            self._req.tenant_id,
+            self._req.corpus_id,
+            self._req.document_id,
+            self._req.document_version,
+        )
+        if len(stored) != len(self._parents_list) + len(self._children_list):
+            raise RuntimeError(
+                f"verify failed: chunk record count {len(stored)} != "
+                f"{len(self._parents_list) + len(self._children_list)}"
+            )
+        for rec in stored:
+            if (
+                rec.tenant_id != self._req.tenant_id
+                or rec.corpus_id != self._req.corpus_id
+                or rec.document_id != self._req.document_id
+                or rec.document_version != self._req.document_version
+            ):
+                raise RuntimeError(f"verify failed: identity mismatch on chunk {rec.chunk_id}")
+
+        # New version must still be uncommitted (processing), not already active.
+        current = self._store.get_document(
+            self._req.tenant_id,
+            self._req.corpus_id,
+            self._req.document_id,
+            self._req.document_version,
+        )
+        # The new version must exist and be in a committable state. A resumed
+        # commit may find its own version already active (committed by the prior
+        # attempt); that is allowed here because the CAS in commit_active_version
+        # is the authoritative race guard, not this pre-check.
+        if current is None:
+            raise RuntimeError("verify failed: new version missing before commit")
+        if current.status not in (
+            DocumentStatus.PROCESSING,
+            DocumentStatus.FAILED,
+            DocumentStatus.ACTIVE,
+        ):
+            raise RuntimeError(f"verify failed: unexpected status {current.status}")
 
     def _step_publish(self) -> None:
         self._ensure_chunked()
@@ -352,54 +486,76 @@ class IngestionJob:
         ]
         self._vector.upsert(self._req.corpus_id, new_points)
 
-        # Prior active versions (now deprecated in the Metadata DB) must be made
-        # invisible on the data plane too. Re-derived from the control plane so a
-        # resumed publish after a crash still finds them (in-memory state is lost
-        # on restart; build plan §10.10 #3, #6).
-        old_versions = self._store.get_superseded_versions(
+        # Promote THIS version's parents from "processing" to "active" so the
+        # second-auth pass in ParentReader admits them. Never touches other
+        # versions' parents.
+        for pid, chunk in list(self._parents._store.items()):
+            if chunk.document_version == self._req.document_version:
+                md = dict(chunk.metadata)
+                md["status"] = "active"
+                md["deprecated"] = False
+                self._parents.put(chunk.model_copy(update={"metadata": md}))
+
+        # P1-7: deprecate ONLY the version this commit actually replaced (read
+        # from the persisted job record, not a scan of all non-active rows), so
+        # a concurrent job's still-processing version is never disturbed.
+        previous_version = self._store.get_job_previous_version(self._req.job_id)
+        if not previous_version or previous_version == self._req.document_version:
+            return
+        old_chunks = self._store.list_chunk_records(
             self._req.tenant_id,
             self._req.corpus_id,
             self._req.document_id,
-            exclude_version=self._req.document_version,
+            previous_version,
         )
-        for old_version in old_versions:
-            if old_version == self._req.document_version:
+        old_points = []
+        for rec in old_chunks:
+            if rec.chunk_type == "parent":
+                self._parents.deprecate(rec.chunk_id)
                 continue
-            old_chunks = self._store.list_chunk_records(
-                self._req.tenant_id,
-                self._req.corpus_id,
-                self._req.document_id,
-                old_version,
+            child = ChildChunk(
+                child_id=rec.chunk_id,
+                parent_id=rec.parent_id or "",
+                document_id=rec.document_id,
+                document_version=rec.document_version,
+                tenant_id=rec.tenant_id,
+                corpus_id=rec.corpus_id,
+                text=rec.content,
+                section_path=rec.section_path,
             )
-            old_points = []
-            for rec in old_chunks:
-                if rec.chunk_type == "parent":
-                    self._parents.deprecate(rec.chunk_id)
-                    continue
-                child = ChildChunk(
-                    child_id=rec.chunk_id,
-                    parent_id=rec.parent_id or "",
-                    document_id=rec.document_id,
-                    document_version=rec.document_version,
-                    tenant_id=rec.tenant_id,
-                    corpus_id=rec.corpus_id,
-                    text=rec.content,
-                    section_path=rec.section_path,
+            old_points.append(
+                child_chunk_to_point(
+                    child,
+                    acl,
+                    status="inactive",
+                    deprecated=False,
+                    dense_encoder=self._dense,
+                    sparse_encoder=self._sparse,
                 )
-                old_points.append(
-                    child_chunk_to_point(
-                        child,
-                        acl,
-                        status="inactive",
-                        deprecated=False,
-                        dense_encoder=self._dense,
-                        sparse_encoder=self._sparse,
-                    )
-                )
-            if old_points:
-                self._vector.upsert(self._req.corpus_id, old_points)
+            )
+        if old_points:
+            self._vector.upsert(self._req.corpus_id, old_points)
 
     def _step_finalize(self) -> None:
+        # Build and persist the ingestion manifest (build plan §10.9).
+        manifest = IngestionManifest(
+            job_id=self._req.job_id,
+            document_id=self._req.document_id,
+            document_version=self._req.document_version,
+            corpus_id=self._req.corpus_id,
+            tenant_id=self._req.tenant_id,
+            status=JobStatus.SUCCEEDED,
+            started_at=_now(),
+            finished_at=_now(),
+            raw_hash=self._raw_hash,
+            parsed_hash=self._parsed_hash or None,
+            parent_count=len(self._parents_list),
+            child_count=len(self._children_list),
+            parser_version=self._req.parser_version,
+            chunking_version=self._req.chunking_version,
+            embedding_version=self._req.embedding_version,
+        )
+        self._store.set_job_manifest(self._req.job_id, manifest.model_dump_json())
         self._store.mark_job_terminal(
             self._req.job_id,
             JobStatus.SUCCEEDED,
@@ -408,15 +564,32 @@ class IngestionJob:
         )
 
     # ------------------------------------------------------------------ #
-    # Compensation (build plan §10.5): on pre-commit failure, delete this
-    # version's data-plane artifacts; never touch the existing active version.
+    # Compensation (build plan §10.5 / §10.10 #7): on pre-commit failure,
+    # delete THIS version's data-plane artifacts; never touch the existing
+    # active version. Idempotent and does NOT rely on in-memory state: it
+    # re-derives chunk ids deterministically and also removes the control-plane
+    # chunk records and marks the processing document row failed.
     # ------------------------------------------------------------------ #
     def _compensate(self) -> None:
+        self._ensure_chunked()
         point_ids = [child_point_id(c.child_id) for c in self._children_list]
         if point_ids:
             self._vector.delete(self._req.corpus_id, point_ids)
         for parent in self._parents_list:
             self._parents.delete(parent.parent_id)
+        self._store.delete_chunk_records(
+            self._req.tenant_id,
+            self._req.corpus_id,
+            self._req.document_id,
+            self._req.document_version,
+        )
+        self._store.clear_steps(self._req.job_id)
+        self._store.mark_document_failed(
+            self._req.tenant_id,
+            self._req.corpus_id,
+            self._req.document_id,
+            self._req.document_version,
+        )
 
     # ------------------------------------------------------------------ #
     # Helpers
