@@ -1,4 +1,9 @@
-from agentic_rag_enterprise.schemas import Evidence, GroundedAnswer, SufficiencyDecision, SufficiencyStatus
+from agentic_rag_enterprise.schemas import (
+    Evidence,
+    GroundedAnswer,
+    SufficiencyDecision,
+    SufficiencyStatus,
+)
 
 
 class SynthesisAgent:

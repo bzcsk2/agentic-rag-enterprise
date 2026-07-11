@@ -29,6 +29,4 @@ class CorpusRegistry:
         return self._corpora[corpus_id]
 
     def describe_for_planner(self) -> str:
-        return "\n".join(
-            f"- {c.corpus_id}: {c.description}" for c in self._corpora.values()
-        )
+        return "\n".join(f"- {c.corpus_id}: {c.description}" for c in self._corpora.values())

@@ -1,4 +1,9 @@
-from agentic_rag_enterprise.schemas import Evidence, QueryPlan, SufficiencyDecision, SufficiencyStatus
+from agentic_rag_enterprise.schemas import (
+    Evidence,
+    QueryPlan,
+    SufficiencyDecision,
+    SufficiencyStatus,
+)
 
 
 class SufficientContextAgent:
