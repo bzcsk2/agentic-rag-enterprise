@@ -7,7 +7,7 @@
 - Milestone: **M1** — Secure single-corpus data vertical slice
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
-- Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — IN PROGRESS; contract: `docs/issue-e008-contract.md`.
+- Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
 - Prior issue **E-006.1** — CLOSED at `807aa0c` (deprecated flag in PEP, real cross-tenant tests, Qdrant PDP/PEP equivalence).
 
 > **AGENTS.md is a slim entry point** (build plan §1.7): current Milestone/Issue, fixed
@@ -174,7 +174,7 @@ kept intact; E-007.1 is a narrow fix commit. Scope is a strict subset of the E-0
 9. `RetrievalResult.denied_parent_count` is an int counter (P2-3).
 10. `ruff`, `mypy src/agentic_rag_enterprise`, full `pytest` (incl. `tests/baseline/`) all green.
 
-## E-008 Issue Contract (M1 only) — IN PROGRESS
+## E-008 Issue Contract (M1 only) — CLOSED at `139df74`
 Idempotent ingestion Job + active-version protocol. Full contract (goals, non-goals,
 allowed/forbidden paths, §10.10 cross-store rules, crash-point plan) is versioned at
 `docs/issue-e008-contract.md` — not duplicated here.
