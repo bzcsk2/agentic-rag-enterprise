@@ -52,11 +52,11 @@
 | Upstream file | `project/document_chunker.py` |
 | Upstream symbols | `DocumentChunker` (full class), `__merge_small_parents()`, `__split_large_parents()`, `__clean_small_chunks()`, `__create_child_chunks()` |
 | Target file | `src/agentic_rag_enterprise/ingestion/chunker.py` |
-| Target symbols | `SimpleChunker.chunk()` (flat character split only) |
-| Status | `scaffold` — only flat chunking, no header awareness |
+| Target symbols | `ParentChildChunker.chunk_markdown()` (returns `list[ParentChunk]`, `list[ChildChunk]`), `SimpleChunker.chunk()` (retained adapter) |
+| Status | `implemented` (E-007) — full heading-aware algorithm ported with enterprise differences |
 | Strategy | `port` |
-| Test plan | Characterization: parent/child count, size ranges, metadata propagation |
-| Notes | Upstream `MarkdownHeaderTextSplitter` on `H1`/`H2`/`H3` + `RecursiveCharacterTextSplitter` for children. All rebalancing/merging logic must be ported. |
+| Test plan | `tests/unit/test_parent_child_chunker.py` (heading-aware, merge/split, integrity, stable content-addressed IDs, tenant-scoped IDs, provenance) |
+| Notes | Algorithm ported: `MarkdownHeaderTextSplitter` (H1/H2/H3) + `RecursiveCharacterTextSplitter` children + merge-small / split-large / rebalance. **Enterprise differences**: parent/child IDs are content-addressed (`sha256` of tenant\|corpus\|document\|section_path\|text), never filename-derived (`{stem}_p{i}` is forbidden); every chunk carries provenance (`document_id`, `tenant_id`, `corpus_id`, `section_path`, `document_version`). Trailing small-parent fold is conditional on `< MIN_PARENT_SIZE` so distinct large sections keep separate section paths. |
 
 ### 3. Child Chunk Precise Retrieval + Parent Chunk Context Reading
 
@@ -64,12 +64,12 @@
 |---|---|
 | Upstream file | `project/rag_agent/tools.py:12`, `project/rag_agent/tools.py:51` |
 | Upstream symbols | `ToolFactory._search_child_chunks()`, `ToolFactory._retrieve_parent_chunks()` |
-| Target file | `src/agentic_rag_enterprise/retrieval/retriever.py` |
-| Target symbols | `Retriever.retrieve()` |
-| Status | `scaffold` — mock returns single static evidence |
-| Strategy | `port` |
-| Test plan | Characterization: tool output format, error cases (no results, missing parent) |
-| Notes | Upstream retrieves from Qdrant vector store + JSON parent store. Target has neither. |
+| Target file | `src/agentic_rag_enterprise/retrieval/{retriever.py,hybrid.py,parent_reader.py,models.py}` |
+| Target symbols | `SecureRetriever.retrieve()`, `HybridRetriever.search()`, `ParentReader.load_parent_for_hit()`, `Retriever.retrieve()` (retained mock adapter) |
+| Status | `implemented` (E-007) — secure retrieval path with corpus gate + parent 2nd-auth |
+| Strategy | `compatible-reimplementation` |
+| Test plan | `tests/integration/test_e007_end_to_end.py`, `tests/security/test_parent_reader.py` |
+| Notes | Enterprise envelope wraps the upstream retrieval contract: `SecureRetriever.retrieve()` runs a **corpus-discoverability gate** (`can_discover_corpus` / `allowed_corpus_ids`, fail-closed) BEFORE `build_access_filter`; `HybridRetriever` does dense+sparse RRF over Qdrant; `ParentReader` is the ONLY authorized parent accessor and performs a fail-closed second authorization pass (identity/version/lifecycle/ACL). No `AccessPolicy.can_access`; PEP/PDP are `build_access_filter` / `evaluate_access` / `resource_passes_filter`. |
 
 ### 4. Qdrant Dense + Sparse Hybrid Retrieval
 
@@ -77,12 +77,12 @@
 |---|---|
 | Upstream file | `project/db/vector_db_manager.py` |
 | Upstream symbols | `VectorDbManager` (full class), `create_collection()`, `get_collection()` (returns `QdrantVectorStore` with `RetrievalMode.HYBRID`) |
-| Target file | — |
-| Target symbols | — |
-| Status | `missing` |
+| Target file | `src/agentic_rag_enterprise/storage/vector_store.py` |
+| Target symbols | `VectorStore.create_collection()`, `VectorStore.search()` (dense+sparse `Prefetch` + `FusionQuery(RRF)`), `DenseEncoder`/`SparseEncoder` protocols |
+| Status | `implemented` (E-007) — real in-memory Qdrant hybrid retrieval, encoders injected |
 | Strategy | `port` |
-| Test plan | Characterization: collection creation, hybrid search result format |
-| Notes | Target `Settings` has `qdrant_url`/`qdrant_api_key` fields but no vector DB manager. Upstream uses local Qdrant path + `HuggingFaceEmbeddings` + `FastEmbedSparse`. |
+| Test plan | `tests/integration/test_qdrant_hybrid_retrieval.py` (12-resource ACL matrix + PDP/PEP equivalence + corpus gate) |
+| Notes | Wraps `QdrantClient` directly (not LangChain `QdrantVectorStore`). Dense + sparse `Prefetch` fused via `FusionQuery(fusion=RRF)` with `query_filter` applied to each prefetch (root filter retained as defense-in-depth; local Qdrant ignores root-only filters). **Mandatory filter**: `search()` raises `ValueError` if `filter is None` (no filter-less retrieval). Encoders (`DenseEncoder`/`SparseEncoder`) are injected, not read from `Settings` (E-007 contract forbids touching `config.py`). In-memory Qdrant used in tests; production URL/key come from existing `Settings`. |
 
 ### 5. Conversation Summary + Bounded Window Memory
 
@@ -370,24 +370,24 @@
 | Field | Value |
 |---|---|
 | Upstream file | `project/rag_agent/tools.py:12` |
-| Target file | — |
-| Target symbol | — |
-| Status | `missing` |
-| Strategy | `port` |
-| Test plan | Characterization: result format, score threshold, no-results case, error case |
-| Notes | Qdrant similarity search with score threshold, formatted output. |
+| Target file | `src/agentic_rag_enterprise/retrieval/hybrid.py` |
+| Target symbol | `HybridRetriever.search()` (and `SecureRetriever.retrieve()` entry point) |
+| Status | `implemented` (E-007) — secured hybrid child search |
+| Strategy | `compatible-reimplementation` |
+| Test plan | `tests/integration/test_qdrant_hybrid_retrieval.py` |
+| Notes | Dense+sparse RRF over Qdrant with mandatory `build_access_filter`; corpus-discoverability gate runs first. Returns `RetrievalHit` with ACL/provenance fields for the second-auth pass. |
 
 ### `retrieve_parent_chunks`
 
 | Field | Value |
 |---|---|
 | Upstream file | `project/rag_agent/tools.py:51` |
-| Target file | — |
-| Target symbol | — |
-| Status | `missing` |
-| Strategy | `port` |
-| Test plan | Characterization: JSON store lookup, content+metadata format, missing parent |
-| Notes | JSON parent store lookup, formatted output with content + metadata. |
+| Target file | `src/agentic_rag_enterprise/retrieval/parent_reader.py` |
+| Target symbol | `ParentReader.load_parent_for_hit()` |
+| Status | `implemented` (E-007) — authorized parent accessor with 2nd-auth |
+| Strategy | `compatible-reimplementation` |
+| Test plan | `tests/security/test_parent_reader.py` |
+| Notes | In-memory `ParentStore` is raw/untrusted; `ParentReader` is the ONLY code path that reads it and performs a fail-closed second authorization (tenant/corpus/document/version identity, active+non-deprecated lifecycle, ACL-metadata consistency, `resource_passes_filter`). Guessed/absent parent ids are rejected. |
 
 ### `ToolNode`
 
@@ -549,16 +549,16 @@
 ### Section 1.5 baseline capabilities (17 total)
 | Status | Count | Items |
 |---|---|---|
-| `implemented` | 0 | — |
-| `scaffold` | 8 | PDF/MD ingestion (#1), parent-child chunking (#2), child/parent retrieval (#3), self-correcting retrieval loop (#10), budget limits (#12), fallback answer (#13), Langfuse (#15), RAGAS eval (#17) |
-| `missing` | 9 | Qdrant hybrid (#4), conversation memory (#5), query rewriting (#6), clarification/HITL (#7), parallel agent (#8), tool calling (#9), context compression (#11), answer aggregation (#14), Gradio UI (#16) |
+| `implemented` | 3 | parent-child chunking (#2, E-007), child/parent retrieval (#3, E-007), Qdrant hybrid (#4, E-007) |
+| `scaffold` | 6 | PDF/MD ingestion (#1), self-correcting retrieval loop (#10), budget limits (#12), fallback answer (#13), Langfuse (#15), RAGAS eval (#17) |
+| `missing` | 8 | conversation memory (#5), query rewriting (#6), clarification/HITL (#7), parallel agent (#8), tool calling (#9), context compression (#11), answer aggregation (#14), Gradio UI (#16) |
 
 ### Section 3.3 must-retain execution symbols (16 total)
 | Status | Count | Items |
 |---|---|---|
-| `implemented` | 0 | — |
+| `implemented` | 2 | `search_child_chunks` (E-007, → `HybridRetriever`), `retrieve_parent_chunks` (E-007, → `ParentReader`) |
 | `scaffold` | 3 | `fallback_response`, `MAX_TOOL_CALLS`, `MAX_ITERATIONS` |
-| `missing` | 13 | `summarize_history`, `rewrite_query`, `request_clarification`, `orchestrator`, `should_compress_context`, `compress_context`, `collect_answer`, `aggregate_answers`, `search_child_chunks`, `retrieve_parent_chunks`, `ToolNode`, `InMemorySaver`, `GRAPH_RECURSION_LIMIT` |
+| `missing` | 11 | `summarize_history`, `rewrite_query`, `request_clarification`, `orchestrator`, `should_compress_context`, `compress_context`, `collect_answer`, `aggregate_answers`, `ToolNode`, `InMemorySaver`, `GRAPH_RECURSION_LIMIT` |
 
 ### Configuration key mapping (upstream: 34 keys total)
 | Status | Count |
@@ -572,8 +572,8 @@
 
 ### Key Compatibility Risks
 1. **LangGraph absent**: Target `AgenticRagRuntime` is a plain Python loop, not a LangGraph state machine. All upstream orchestration (interrupts, Send, conditional edges, ToolNode) is lost.
-2. **No vector DB**: Target has Qdrant config but no `VectorDbManager` or Qdrant integration. Retrieval is mock-only.
-3. **No parent-child chunking**: Target `SimpleChunker` lacks heading-aware splitting, parent/child hierarchy, metadata propagation.
+2. **~~No vector DB~~ RESOLVED (E-007)**: `src/agentic_rag_enterprise/storage/vector_store.py` now wraps `QdrantClient` with dense+sparse hybrid RRF. Encoders are injected (not from `Settings`) per the E-007 contract; production still relies on existing `qdrant_url`/`qdrant_api_key` `Settings`.
+3. **~~No parent-child chunking~~ RESOLVED (E-007)**: `ParentChildChunker` provides heading-aware splitting + rebalancing with content-addressed, tenant-scoped IDs and provenance metadata. `SimpleChunker` retained as a compatible adapter.
 4. **Config semantics diverge**: `max_iterations` (3 target vs 10 upstream) and `max_tool_calls` (12 target vs 8 upstream) have different meanings.
 5. **No conversation memory**: Target state has no `conversation_summary`, `pendingQuery`, or bounded history fields.
 6. **No Gradio UI**: Target only has FastAPI; Gradio tab-based document management and chat are missing.

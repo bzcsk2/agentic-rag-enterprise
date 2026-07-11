@@ -16,6 +16,8 @@ dependencies = [
   "pydantic-settings>=2.4.0",
   "langgraph>=0.2.0",
   "langchain-core>=0.3.0",
+  "langchain-text-splitters>=0.3.0",
+  "fastembed>=0.3.0",
   "qdrant-client>=1.10.0",
   "pyyaml>=6.0.2",
   "rich>=13.7.0"
@@ -38,4 +40,4 @@ target-version = "py313"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

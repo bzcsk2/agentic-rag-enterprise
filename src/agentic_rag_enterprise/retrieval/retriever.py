@@ -1,8 +1,27 @@
+"""Retrieval entry points.
+
+``Retriever`` is the M0 baseline mock (kept green for characterization tests).
+``SecureRetriever`` is the E-007 enterprise path: it enforces the **corpus
+discoverability** precondition before any document ACL filter is built, then
+runs authorized hybrid child retrieval and a second parent-authorization pass.
+"""
+
+from agentic_rag_enterprise.config import settings
+from agentic_rag_enterprise.domain.corpus import CorpusConfig
+from agentic_rag_enterprise.domain.security import SecurityContext
+from agentic_rag_enterprise.retrieval.hybrid import HybridRetriever
+from agentic_rag_enterprise.retrieval.models import (
+    CorpusNotDiscoverableError,
+    RetrievalResult,
+)
+from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.schemas import Evidence
+from agentic_rag_enterprise.security.policy import can_discover_corpus
+from agentic_rag_enterprise.storage.vector_store import DenseEncoder, SparseEncoder
 
 
 class Retriever:
-    """Retrieval interface.
+    """Retrieval interface (M0 baseline mock).
 
     Replace the mock implementation with Qdrant hybrid search, payload filters,
     parent-child chunk retrieval, and reranking.
@@ -23,3 +42,73 @@ class Retriever:
                 metadata={"retriever": "mock"},
             )
         ][:top_k]
+
+
+class SecureRetriever:
+    """Enterprise retrieval with corpus discoverability + parent 2nd auth."""
+
+    def __init__(
+        self,
+        hybrid: HybridRetriever,
+        parent_reader: ParentReader,
+        *,
+        default_top_k: int | None = None,
+    ) -> None:
+        self._hybrid = hybrid
+        self._parent_reader = parent_reader
+        self._default_top_k = default_top_k or settings.max_retrieval_top_k
+
+    def validate_corpus(self, ctx: SecurityContext, corpus: CorpusConfig) -> None:
+        """Raise :class:`CorpusNotDiscoverableError` if the corpus gate fails."""
+        if corpus.tenant_id != ctx.tenant_id:
+            raise CorpusNotDiscoverableError(
+                f"corpus {corpus.corpus_id} belongs to tenant {corpus.tenant_id}, "
+                f"not {ctx.tenant_id}"
+            )
+        if not corpus.enabled:
+            raise CorpusNotDiscoverableError(f"corpus {corpus.corpus_id} is disabled")
+        if not corpus.searchable:
+            raise CorpusNotDiscoverableError(f"corpus {corpus.corpus_id} is not searchable")
+        if not can_discover_corpus(ctx, corpus.corpus_id):
+            raise CorpusNotDiscoverableError(
+                f"corpus {corpus.corpus_id} is not discoverable for this context"
+            )
+
+    def retrieve(
+        self,
+        ctx: SecurityContext,
+        query: str,
+        corpus: CorpusConfig,
+        top_k: int | None = None,
+        *,
+        dense_encoder: DenseEncoder,
+        sparse_encoder: SparseEncoder,
+    ) -> RetrievalResult:
+        """Run the locked secure-retrieval flow and return typed results.
+
+        Fails closed: any corpus-gate failure yields an empty
+        :class:`RetrievalResult` rather than broadening access.
+        """
+        if top_k is None:
+            top_k = self._default_top_k
+
+        try:
+            self.validate_corpus(ctx, corpus)
+        except CorpusNotDiscoverableError:
+            return RetrievalResult(hits=[], denied_parent_ids=[])
+
+        child_hits = self._hybrid.search(
+            ctx, corpus, query, top_k, dense_encoder=dense_encoder, sparse_encoder=sparse_encoder
+        )
+
+        hits: list[tuple] = []
+        denied: list[str] = []
+        for hit in child_hits:
+            try:
+                parent = self._parent_reader.load_parent_for_hit(hit, ctx)
+            except Exception:
+                denied.append(hit.parent_id)
+                continue
+            hits.append((hit, parent))
+
+        return RetrievalResult(hits=hits, denied_parent_ids=denied)
