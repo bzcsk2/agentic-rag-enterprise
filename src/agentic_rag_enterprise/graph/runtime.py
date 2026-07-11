@@ -21,8 +21,9 @@ class AgenticRagRuntime:
         self.synthesis = SynthesisAgent()
 
     def run(self, query: str) -> AgenticRagState:
-        state = AgenticRagState(user_query=query, normalized_query=query.strip())
-        state.plan = self.planner.plan(state.normalized_query)
+        normalized_query = query.strip()
+        state = AgenticRagState(user_query=query, normalized_query=normalized_query)
+        state.plan = self.planner.plan(normalized_query)
         state.add_trace("plan", state.plan.model_dump())
 
         while state.iteration < settings.max_iterations:
