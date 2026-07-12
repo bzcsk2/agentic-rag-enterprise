@@ -96,10 +96,19 @@ def can_discover_corpus(ctx: SecurityContext, corpus_id: str) -> bool:
 def can_manage_document(ctx: SecurityContext, doc: SourceDocument) -> bool:
     """Write-authorization for document mutation (update/delete/purge/ACL).
 
-    Fail-closed: a caller may mutate a document only if it is in their tenant,
-    the corpus is discoverable to them, AND they can already read the document
-    (the canonical PDP allows the document's ACL for ``ctx``). Cross-tenant and
-    non-discoverable corpora are denied outright (build plan §10.6/§10.7).
+    Fail-closed: a caller may mutate a document only if ALL hold:
+
+    * it is in their tenant,
+    * the corpus is discoverable to them,
+    * they can already READ the document (the canonical PDP allows the
+      document's ACL for ``ctx``), AND
+    * they are an explicit OWNER of the document (named in the ACL allow
+      lists) or are an admin (auditable break-glass).
+
+    Read access alone is NOT sufficient: a tenant member who can read a shared
+    document must not be able to update/delete/purge it or tighten its ACL
+    (build plan §10.6/§10.7) — write requires ownership. Cross-tenant and
+    non-discoverable corpora are denied outright.
     """
     if ctx.tenant_id != doc.tenant_id:
         return False
@@ -114,7 +123,15 @@ def can_manage_document(ctx: SecurityContext, doc: SourceDocument) -> bool:
         denied_user_ids=doc.denied_user_ids,
         denied_group_ids=doc.denied_group_ids,
     )
-    return evaluate_access(ctx, acl) is AuthorizationDecision.ALLOW
+    if evaluate_access(ctx, acl) is not AuthorizationDecision.ALLOW:
+        return False
+    if ctx.is_admin:
+        return True
+    if ctx.user_id in doc.allowed_user_ids:
+        return True
+    if set(ctx.groups) & set(doc.allowed_group_ids):
+        return True
+    return False
 
 
 class AccessPolicy:

@@ -67,7 +67,12 @@ def _mgr_and_ctx():
 
 
 def _ingest_v1(mgr: DocumentManager) -> None:
-    acl = ResourceAcl(**acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public"))
+    acl = ResourceAcl(
+        **acl_payload(
+            tenant_id="t1", acl_scope="restricted",
+            security_level="public", allowed_user_ids=["u1"],
+        )
+    )
     req = IngestionRequest(
         tenant_id="t1", corpus_id="eng", document_id="doc1",
         document_version="v1", content=SAMPLE_MARKDOWN, acl=acl, job_id="j-init",
@@ -174,3 +179,60 @@ def test_non_discoverable_corpus_mutation_is_refused() -> None:
     hidden = make_security_context(allowed_corpus_ids=["other-corpus"])
     with pytest.raises(DocumentMutationError):
         mgr.delete(hidden, corpus_id="eng", document_id="doc1")
+
+
+def _ingest_tenant_scoped(mgr: DocumentManager) -> None:
+    """A tenant-scoped (readable by every tenant member) but owner-less document."""
+    acl = ResourceAcl(
+        **acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")
+    )
+    req = IngestionRequest(
+        tenant_id="t1", corpus_id="eng", document_id="doc2",
+        document_version="v1", content=SAMPLE_MARKDOWN, acl=acl, job_id="j-init2",
+    )
+    mgr.ingest(req)
+
+
+def test_same_tenant_readable_but_not_owner_is_refused() -> None:
+    """P1-3: a tenant member who can READ a shared doc cannot MUTATE it.
+
+    ``doc2`` is ``acl_scope='tenant'`` (any ``t1`` member can read), but no
+    explicit owner is named, so a non-admin reader (``u2``) must be refused all
+    write operations (build plan §10.6/§10.7).
+    """
+    mgr, _, _, _, _ = _mgr_and_ctx()
+    _ingest_tenant_scoped(mgr)
+    reader = make_security_context(user_id="u2")
+    with pytest.raises(DocumentMutationError):
+        mgr.delete(reader, corpus_id="eng", document_id="doc2")
+    with pytest.raises(DocumentMutationError):
+        mgr.purge(reader, corpus_id="eng", document_id="doc2")
+    with pytest.raises(DocumentMutationError):
+        mgr.update(
+            reader, corpus_id="eng", document_id="doc2",
+            content="x", job_id="jx", document_version="v2",
+        )
+    with pytest.raises(DocumentMutationError):
+        mgr.tighten_acl(
+            reader, corpus_id="eng", document_id="doc2",
+            acl=ResourceAcl(tenant_id="t1", security_level="public", acl_scope="tenant"),
+        )
+
+
+def test_delete_advances_revision_blocks_stale_in_flight_update() -> None:
+    """P1-1: a logical delete must bump ``lifecycle_revision`` so an in-flight
+    update job (captured ``base_revision`` before the delete) loses its
+    ``commit_active_version`` CAS and cannot resurrect a deleted document.
+    """
+    mgr, mstore, _, _, ctx = _mgr_and_ctx()
+    _ingest_v1(mgr)
+    base = mstore.get_current_revision("t1", "eng", "doc1")
+    # A concurrent update job was already acquired with this base_revision...
+    mgr.delete(ctx, corpus_id="eng", document_id="doc1")
+    # ...but the delete advanced the revision, so the stale update must fail.
+    assert mstore.get_current_revision("t1", "eng", "doc1") == base + 1
+    assert mstore.get_document("t1", "eng", "doc1", "v1").status == DocumentStatus.DELETED
+    # The in-flight job's commit would raise ActiveVersionConflict (verified at
+    # the control-plane level in test_metadata_store). Here we assert the delete
+    # itself is authoritative: retrieval would now filter the doc out.
+    assert mstore.get_active_version("t1", "eng", "doc1") is None

@@ -49,7 +49,10 @@ def _hit_for(child, acl) -> RetrievalHit:
 
 
 def _setup():
-    acl = acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")
+    acl = acl_payload(
+        tenant_id="t1", acl_scope="restricted",
+        security_level="public", allowed_user_ids=["u1"],
+    )
     vstore, pstore, children = _ingest("eng", "t1", acl)
     mstore = active_metadata_store("t1", "eng", "doc1", "v1")
     mgr = DocumentManager(
@@ -80,7 +83,7 @@ def test_deny_tightening_revokes_previously_authorized_user() -> None:
     reader = ParentReader(pstore)
     hit = _hit_for(children[0], acl)
 
-    # u1 is authorized before tightening (tenant-scoped).
+    # u1 is authorized before tightening (explicit owner of the restricted doc).
     assert reader.load_parent_for_hit(hit, ctx_u1) is not None
 
     # Tighten to restricted and deny u1 explicitly. No re-embedding occurs.
