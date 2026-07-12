@@ -747,7 +747,11 @@ def test_delete_document_removes_all_versions_and_is_idempotent() -> None:
     os.unlink(path)
 
 
-def test_update_document_acl_preserves_lifecycle_revision() -> None:
+def test_update_document_acl_advances_lifecycle_revision_for_fencing() -> None:
+    """ACL tightening must advance ``lifecycle_revision`` so an in-flight update
+    job (captured ``base_revision`` before the tighten) loses its commit CAS and
+    cannot publish a new version carrying the pre-tighten ACL (build plan §10.7).
+    """
     path = _tmp_db_path()
     store = MetadataStore(path)
     _seed_corpus(store)
@@ -769,9 +773,48 @@ def test_update_document_acl_preserves_lifecycle_revision() -> None:
         "SELECT lifecycle_revision, security_level, acl_scope, allowed_user_ids "
         "FROM documents WHERE tenant_id='t1' AND corpus_id='eng' AND document_id='d1' AND version='v1'"
     ).fetchone()
-    assert row["lifecycle_revision"] == rev_before  # monotonic revision untouched
+    assert row["lifecycle_revision"] == rev_before + 1  # revision advanced (fencing)
     assert row["security_level"] == "secret"
     assert row["acl_scope"] == "restricted"
     assert json.loads(row["allowed_user_ids"]) == ["u9"]
+    store.close()
+    os.unlink(path)
+
+
+def test_logical_delete_advances_revision_blocks_stale_update() -> None:
+    """P1-1: logical delete bumps ``lifecycle_revision`` so an in-flight update
+    job acquired before the delete fails its ``commit_active_version`` CAS and
+    cannot resurrect a deleted document (build plan §10.10 #8).
+    """
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.ACTIVE))
+    base = store.get_current_revision("t1", "eng", "d1")
+    # An update job had already been acquired with base_revision == base.
+    store.logical_delete("t1", "eng", "d1", "v1", deleted_at=_FIXED)
+    assert store.get_current_revision("t1", "eng", "d1") == base + 1
+    assert store.get_document("t1", "eng", "d1", "v1").status == DocumentStatus.DELETED
+    # The stale update job tries to commit a new version with the old base.
+    store.upsert_document(_make_doc(version="v2", status=DocumentStatus.PROCESSING))
+    with pytest.raises(ActiveVersionConflict):
+        store.commit_active_version(
+            tenant_id="t1", corpus_id="eng", document_id="d1",
+            new_version="v2", expected_revision=base,
+        )
+    store.close()
+    os.unlink(path)
+
+
+def test_logical_delete_is_idempotent_no_double_revision_bump() -> None:
+    path = _tmp_db_path()
+    store = MetadataStore(path)
+    _seed_corpus(store)
+    store.upsert_document(_make_doc(version="v1", status=DocumentStatus.ACTIVE))
+    store.logical_delete("t1", "eng", "d1", "v1", deleted_at=_FIXED)
+    rev_after_first = store.get_current_revision("t1", "eng", "d1")
+    # Re-running logical delete on an already-deleted row must not bump again.
+    store.logical_delete("t1", "eng", "d1", "v1", deleted_at=_FIXED)
+    assert store.get_current_revision("t1", "eng", "d1") == rev_after_first
     store.close()
     os.unlink(path)

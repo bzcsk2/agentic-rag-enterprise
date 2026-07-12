@@ -910,6 +910,50 @@ class MetadataStore:
             ),
         )
 
+    def logical_delete(
+        self,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        version: str,
+        *,
+        deleted_at: datetime,
+    ) -> int:
+        """Logical delete of one (document, version) row: flip to ``DELETED`` and
+        advance ``lifecycle_revision`` atomically.
+
+        The revision bump is the competition guard against an in-flight
+        :class:`IngestionJob` acquired *before* the delete: such a job holds a
+        ``base_revision`` older than the new revision, so its
+        ``commit_active_version`` CAS fails closed and cannot resurrect a deleted
+        document (build plan §10.10 #8). Idempotent: re-asserting ``DELETED`` on
+        an already-deleted row is a no-op and does not bump the revision again.
+        """
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.get_current_revision(tenant_id, corpus_id, document_id)
+            new_rev = current + 1
+            cur.execute(
+                "UPDATE documents SET status='deleted', deprecated=1, deleted_at=?, "
+                "lifecycle_revision=? "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=? "
+                "AND status <> 'deleted'",
+                (
+                    deleted_at.isoformat(),
+                    new_rev,
+                    tenant_id,
+                    corpus_id,
+                    document_id,
+                    version,
+                ),
+            )
+            cur.execute("COMMIT")
+            return new_rev
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+
     def get_document_latest(
         self, tenant_id: str, corpus_id: str, document_id: str
     ) -> Optional[SourceDocument]:
@@ -949,28 +993,43 @@ class MetadataStore:
         denied_user_ids: list[str],
         denied_group_ids: list[str],
     ) -> None:
-        """Patch only the ACL columns of one (document, version) row.
+        """Patch the ACL columns of one (document, version) row AND advance
+        ``lifecycle_revision`` atomically.
 
-        Targeted UPDATE (not a full upsert) so the monotonic ``lifecycle_revision``
-        is never disturbed by an ACL change (build plan §10.7, no re-embedding).
+        The revision advance is the fencing guard required by build plan §10.7 /
+        §10.10 #8: an :class:`IngestionJob` acquired *before* the ACL tighten
+        captured an older ``base_revision``, so its ``commit_active_version`` CAS
+        fails and it cannot publish a new version carrying the pre-tighten ACL.
+        No vectors change (payload-only, §10.7).
         """
-        self._conn.execute(
-            "UPDATE documents SET security_level=?, acl_scope=?, "
-            "allowed_user_ids=?, allowed_group_ids=?, denied_user_ids=?, denied_group_ids=? "
-            "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=?",
-            (
-                security_level,
-                acl_scope,
-                _as_json_list(allowed_user_ids),
-                _as_json_list(allowed_group_ids),
-                _as_json_list(denied_user_ids),
-                _as_json_list(denied_group_ids),
-                tenant_id,
-                corpus_id,
-                document_id,
-                version,
-            ),
-        )
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.get_current_revision(tenant_id, corpus_id, document_id)
+            new_rev = current + 1
+            cur.execute(
+                "UPDATE documents SET security_level=?, acl_scope=?, "
+                "allowed_user_ids=?, allowed_group_ids=?, denied_user_ids=?, denied_group_ids=?, "
+                "lifecycle_revision=? "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=?",
+                (
+                    security_level,
+                    acl_scope,
+                    _as_json_list(allowed_user_ids),
+                    _as_json_list(allowed_group_ids),
+                    _as_json_list(denied_user_ids),
+                    _as_json_list(denied_group_ids),
+                    new_rev,
+                    tenant_id,
+                    corpus_id,
+                    document_id,
+                    version,
+                ),
+            )
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
 
     def delete_document(self, tenant_id: str, corpus_id: str, document_id: str) -> None:
         """Physical purge: remove every version row for a document. Idempotent.

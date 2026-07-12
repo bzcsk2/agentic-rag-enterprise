@@ -41,7 +41,10 @@ def _retriever(vstore, pstore, mstore) -> SecureRetriever:
 
 
 def test_lifecycle_ingest_retrieve_update_delete_purge_reingest() -> None:
-    acl = acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")
+    acl = acl_payload(
+        tenant_id="t1", acl_scope="restricted",
+        security_level="public", allowed_user_ids=["u1"],
+    )
     vstore, pstore, _ = _ingest("eng", "t1", acl)
     mstore = active_metadata_store("t1", "eng", "doc1", "v1")
     mgr = _mgr(mstore, vstore, pstore)

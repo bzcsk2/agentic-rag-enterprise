@@ -1052,10 +1052,9 @@ class DocumentManager:
             self._vector.update_payload(
                 corpus_id, point_ids, {"status": "deleted", "deprecated": True}
             )
-        self._parents.deprecate_document(document_id, version)
-        self._store.set_document_status(
-            doc.tenant_id, corpus_id, document_id, version,
-            DocumentStatus.DELETED, deleted_at=_now(),
+        self._parents.deprecate_document(doc.tenant_id, corpus_id, document_id, version)
+        self._store.logical_delete(
+            doc.tenant_id, corpus_id, document_id, version, deleted_at=_now()
         )
 
     def purge(self, ctx: SecurityContext, *, corpus_id: str, document_id: str) -> None:
@@ -1082,7 +1081,7 @@ class DocumentManager:
             )
             if point_ids:
                 self._vector.delete(corpus_id, point_ids)
-            self._parents.delete_document(document_id, version)
+            self._parents.delete_document(doc.tenant_id, corpus_id, document_id, version)
             self._store.delete_chunk_records(doc.tenant_id, corpus_id, document_id, version)
         self._store.delete_document(doc.tenant_id, corpus_id, document_id)
 
@@ -1118,7 +1117,9 @@ class DocumentManager:
         )
         if point_ids:
             self._vector.update_payload(corpus_id, point_ids, acl_fields)
-        self._parents.update_acl_document(document_id, version, acl_fields)
+        self._parents.update_acl_document(
+            doc.tenant_id, corpus_id, document_id, version, acl_fields
+        )
         self._store.update_document_acl(
             doc.tenant_id, corpus_id, document_id, version,
             security_level=acl.security_level,
