@@ -30,7 +30,11 @@ from agentic_rag_enterprise.domain.ingestion import (
 )
 from agentic_rag_enterprise.domain.security import SecurityContext
 from agentic_rag_enterprise.ingestion.chunker import ChildChunk, ParentChildChunker, ParentChunk
-from agentic_rag_enterprise.security.policy import ResourceAcl, can_manage_document
+from agentic_rag_enterprise.security.policy import (
+    ResourceAcl,
+    can_manage_document,
+    is_acl_tightening,
+)
 from agentic_rag_enterprise.storage.metadata_store import (
     ActiveVersionConflict,
     BuildConflict,
@@ -1045,6 +1049,15 @@ class DocumentManager:
             return  # already logically deleted: idempotent no-op
         version = doc.version
 
+        # 1) Control plane FIRST (build plan §10.10 #8): atomically flip the
+        #    active version to DELETED and advance lifecycle_revision. This is the
+        #    competition guard — an in-flight update job holding an older
+        #    base_revision fails its commit CAS and cannot resurrect the document.
+        self._store.logical_delete(
+            doc.tenant_id, corpus_id, document_id, version, deleted_at=_now()
+        )
+        # 2) Idempotent data-plane propagation (Qdrant + Parent Store). Retrieval
+        #    filtering via status=active is already in effect from step 1.
         point_ids = self._vector.list_point_ids_by_document(
             corpus_id, doc.tenant_id, corpus_id, document_id, version
         )
@@ -1053,9 +1066,6 @@ class DocumentManager:
                 corpus_id, point_ids, {"status": "deleted", "deprecated": True}
             )
         self._parents.deprecate_document(doc.tenant_id, corpus_id, document_id, version)
-        self._store.logical_delete(
-            doc.tenant_id, corpus_id, document_id, version, deleted_at=_now()
-        )
 
     def purge(self, ctx: SecurityContext, *, corpus_id: str, document_id: str) -> None:
         """Physical purge (build plan §10.6): remove the document's data plane.
@@ -1103,6 +1113,12 @@ class DocumentManager:
         """
         doc = self._resolve_active(ctx, corpus_id, document_id)
         version = doc.version
+        old_acl = _acl_from_doc(doc)
+        if not is_acl_tightening(old_acl, acl):
+            raise DocumentMutationError(
+                "ACL change is a widening, not a tightening; rejected "
+                "(build plan §10.7). Use a separate widening protocol."
+            )
         acl_fields: dict[str, object] = {
             "security_level": acl.security_level,
             "acl_scope": acl.acl_scope,
@@ -1112,14 +1128,10 @@ class DocumentManager:
             "denied_group_ids": acl.denied_group_ids,
         }
 
-        point_ids = self._vector.list_point_ids_by_document(
-            corpus_id, doc.tenant_id, corpus_id, document_id, version
-        )
-        if point_ids:
-            self._vector.update_payload(corpus_id, point_ids, acl_fields)
-        self._parents.update_acl_document(
-            doc.tenant_id, corpus_id, document_id, version, acl_fields
-        )
+        # 1) Control plane FIRST (build plan §10.7 / §10.10 #8): atomically bump
+        #    lifecycle_revision (fence) and update the ACL row. An in-flight update
+        #    job holding an older base_revision fails its commit CAS and cannot
+        #    publish a new version carrying the pre-tighten ACL.
         self._store.update_document_acl(
             doc.tenant_id, corpus_id, document_id, version,
             security_level=acl.security_level,
@@ -1128,6 +1140,16 @@ class DocumentManager:
             allowed_group_ids=acl.allowed_group_ids,
             denied_user_ids=acl.denied_user_ids,
             denied_group_ids=acl.denied_group_ids,
+        )
+        # 2) Idempotent data-plane propagation (Qdrant + Parent Store). Payload-
+        #    only, no re-embedding (§10.7).
+        point_ids = self._vector.list_point_ids_by_document(
+            corpus_id, doc.tenant_id, corpus_id, document_id, version
+        )
+        if point_ids:
+            self._vector.update_payload(corpus_id, point_ids, acl_fields)
+        self._parents.update_acl_document(
+            doc.tenant_id, corpus_id, document_id, version, acl_fields
         )
 
 

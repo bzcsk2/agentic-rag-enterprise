@@ -919,33 +919,67 @@ class MetadataStore:
         *,
         deleted_at: datetime,
     ) -> int:
-        """Logical delete of one (document, version) row: flip to ``DELETED`` and
-        advance ``lifecycle_revision`` atomically.
+        """Logical delete of a document: flip the ACTIVE version to ``DELETED`` and
+        advance ``lifecycle_revision`` atomically, as the FIRST step of a
+        control-plane-first delete (build plan §10.10 #8).
 
-        The revision bump is the competition guard against an in-flight
-        :class:`IngestionJob` acquired *before* the delete: such a job holds a
-        ``base_revision`` older than the new revision, so its
-        ``commit_active_version`` CAS fails closed and cannot resurrect a deleted
-        document (build plan §10.10 #8). Idempotent: re-asserting ``DELETED`` on
-        an already-deleted row is a no-op and does not bump the revision again.
+        This is the competition guard against an in-flight :class:`IngestionJob`
+        acquired *before* the delete: such a job holds a ``base_revision`` older
+        than the new revision, so its ``commit_active_version`` CAS fails closed
+        and cannot resurrect a deleted document. Because the revision bump happens
+        here — before any Qdrant/Parent-Store propagation — there is no window in
+        which a stale update job can commit a new active version.
+
+        The target is resolved *inside* the transaction: if ``version`` is no
+        longer active (a concurrent update activated another), the currently
+        active version is deleted instead, so a delete always removes the
+        document's active visibility. Idempotent: re-asserting ``DELETED`` on an
+        already-deleted document is a no-op and does not bump the revision again.
         """
         cur = self._conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
-            current = self.get_current_revision(tenant_id, corpus_id, document_id)
+            target = cur.execute(
+                "SELECT version, lifecycle_revision, status FROM documents "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=?",
+                (tenant_id, corpus_id, document_id, version),
+            ).fetchone()
+            if target is None:
+                # Version does not exist (already purged) -> nothing to do.
+                cur.execute("COMMIT")
+                return self.get_current_revision(tenant_id, corpus_id, document_id)
+            if target["status"] == "deleted":
+                cur.execute("COMMIT")
+                return int(target["lifecycle_revision"])
+            if target["status"] != "active":
+                # The passed version was superseded by a concurrent update; delete
+                # the currently active version so active visibility is removed.
+                active = cur.execute(
+                    "SELECT version, lifecycle_revision FROM documents "
+                    "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND status='active' "
+                    "ORDER BY lifecycle_revision DESC, rowid DESC LIMIT 1",
+                    (tenant_id, corpus_id, document_id),
+                ).fetchone()
+                if active is None:
+                    cur.execute("COMMIT")
+                    return self.get_current_revision(tenant_id, corpus_id, document_id)
+                target_version = active["version"]
+                current = int(active["lifecycle_revision"])
+            else:
+                target_version = target["version"]
+                current = int(target["lifecycle_revision"])
             new_rev = current + 1
             cur.execute(
                 "UPDATE documents SET status='deleted', deprecated=1, deleted_at=?, "
                 "lifecycle_revision=? "
-                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=? "
-                "AND status <> 'deleted'",
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=?",
                 (
                     deleted_at.isoformat(),
                     new_rev,
                     tenant_id,
                     corpus_id,
                     document_id,
-                    version,
+                    target_version,
                 ),
             )
             cur.execute("COMMIT")
@@ -994,18 +1028,30 @@ class MetadataStore:
         denied_group_ids: list[str],
     ) -> None:
         """Patch the ACL columns of one (document, version) row AND advance
-        ``lifecycle_revision`` atomically.
+        ``lifecycle_revision`` atomically, as the FIRST step of a control-plane-
+        first ACL tighten (build plan §10.7 / §10.10 #8).
 
-        The revision advance is the fencing guard required by build plan §10.7 /
-        §10.10 #8: an :class:`IngestionJob` acquired *before* the ACL tighten
-        captured an older ``base_revision``, so its ``commit_active_version`` CAS
-        fails and it cannot publish a new version carrying the pre-tighten ACL.
+        The revision advance is the fencing guard: an :class:`IngestionJob`
+        acquired *before* the ACL tighten captured an older ``base_revision``, so
+        its ``commit_active_version`` CAS fails and it cannot publish a new
+        version carrying the pre-tighten ACL. The active check inside the
+        transaction means a tighten that races a concurrent logical delete is a
+        no-op (the delete wins; retrieval filters the document regardless).
         No vectors change (payload-only, §10.7).
         """
         cur = self._conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
-            current = self.get_current_revision(tenant_id, corpus_id, document_id)
+            row = cur.execute(
+                "SELECT lifecycle_revision, status FROM documents "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=?",
+                (tenant_id, corpus_id, document_id, version),
+            ).fetchone()
+            if row is None or row["status"] != "active":
+                # Not active (concurrently deleted): no active version to fence.
+                cur.execute("COMMIT")
+                return
+            current = int(row["lifecycle_revision"])
             new_rev = current + 1
             cur.execute(
                 "UPDATE documents SET security_level=?, acl_scope=?, "

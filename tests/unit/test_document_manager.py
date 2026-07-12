@@ -7,10 +7,12 @@ fail-closed cross-tenant / non-discoverable refusal.
 
 import os
 import tempfile
+from datetime import datetime, timezone
 
 import pytest
 from qdrant_client import QdrantClient
 
+from agentic_rag_enterprise.domain.document import SourceDocument
 from agentic_rag_enterprise.domain.ingestion import DocumentStatus
 from agentic_rag_enterprise.ingestion.chunker import ParentChildChunker
 from agentic_rag_enterprise.ingestion.job import (
@@ -19,7 +21,10 @@ from agentic_rag_enterprise.ingestion.job import (
     IngestionRequest,
 )
 from agentic_rag_enterprise.security.policy import ResourceAcl
-from agentic_rag_enterprise.storage.metadata_store import MetadataStore
+from agentic_rag_enterprise.storage.metadata_store import (
+    ActiveVersionConflict,
+    MetadataStore,
+)
 from agentic_rag_enterprise.storage.parent_store import ParentStore
 from agentic_rag_enterprise.storage.vector_store import VectorStore
 
@@ -31,6 +36,8 @@ from tests.fixtures import (
     acl_payload,
     make_security_context,
 )
+
+_TS = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
 
 def _fresh_store():
@@ -70,7 +77,7 @@ def _ingest_v1(mgr: DocumentManager) -> None:
     acl = ResourceAcl(
         **acl_payload(
             tenant_id="t1", acl_scope="restricted",
-            security_level="public", allowed_user_ids=["u1"],
+            security_level="public", allowed_user_ids=["u1", "u2"],
         )
     )
     req = IngestionRequest(
@@ -137,22 +144,112 @@ def test_purge_refuses_non_deleted_document() -> None:
 
 def test_tighten_acl_patches_payloads_without_reembedding() -> None:
     mgr, mstore, vstore, _, ctx = _mgr_and_ctx()
-    _ingest_v1(mgr)
+    _ingest_v1(mgr)  # restricted, allowed=['u1', 'u2']
+    # Genuine tightening: remove u2 (allowed set shrinks) — no re-embedding.
     tight = ResourceAcl(
         tenant_id="t1", security_level="public", acl_scope="restricted",
-        allowed_user_ids=["u2"], allowed_group_ids=[], denied_user_ids=[], denied_group_ids=[],
+        allowed_user_ids=["u1"], allowed_group_ids=[], denied_user_ids=[], denied_group_ids=[],
     )
     mgr.tighten_acl(ctx, corpus_id="eng", document_id="doc1", acl=tight)
 
     ids = vstore.list_point_ids_by_document("eng", "t1", "eng", "doc1", "v1")
     retrieved = vstore._client.retrieve(collection_name="eng", ids=ids, with_payload=True)
     assert all(
-        p.payload["acl_scope"] == "restricted" and p.payload["allowed_user_ids"] == ["u2"]
+        p.payload["acl_scope"] == "restricted" and p.payload["allowed_user_ids"] == ["u1"]
         for p in retrieved
     )
     doc = mstore.get_document("t1", "eng", "doc1", "v1")
     assert doc.acl_scope == "restricted"
-    assert doc.allowed_user_ids == ["u2"]
+    assert doc.allowed_user_ids == ["u1"]
+
+
+def _make_v2_processing(mstore: MetadataStore) -> None:
+    """Simulate an in-flight update job that has written its control-plane row
+    (status=processing) and is about to call ``commit_active_version``."""
+    mstore.upsert_document(
+        SourceDocument(
+            document_id="doc1", tenant_id="t1", corpus_id="eng",
+            source_uri="inline://doc1", source_connector="file", title="doc1",
+            source_filename="doc1.md", mime_type="text/markdown", version="v2",
+            content_hash="def", status=DocumentStatus.PROCESSING, authority_level=50,
+            deprecated=False, acl_policy_id="default", security_level="public",
+            acl_scope="restricted", allowed_user_ids=["u1"], allowed_group_ids=[],
+            denied_user_ids=[], denied_group_ids=[], parser_name="markdown",
+            parser_version="1.0", chunking_version="1.0", embedding_model="fake",
+            embedding_version="1.0", discovered_at=_TS, last_synced_at=_TS,
+        )
+    )
+
+
+def test_delete_control_plane_fence_blocks_in_flight_update() -> None:
+    """P1-1 (ordering): delete advances the control-plane revision BEFORE any
+    data-plane propagation, so an in-flight update job holding the pre-delete
+    ``base_revision`` cannot commit a resurrected v2 after the data plane is
+    touched (build plan §10.10 #8)."""
+    mgr, mstore, vstore, _, ctx = _mgr_and_ctx()
+    _ingest_v1(mgr)
+    base = mstore.get_current_revision("t1", "eng", "doc1")
+    mgr.delete(ctx, corpus_id="eng", document_id="doc1")
+    # The stale in-flight update job now attempts to commit its v2.
+    _make_v2_processing(mstore)
+    with pytest.raises(ActiveVersionConflict):
+        mstore.commit_active_version(
+            tenant_id="t1", corpus_id="eng", document_id="doc1",
+            new_version="v2", expected_revision=base,
+        )
+    # No active version; the deleted v1 Qdrant points are already flipped.
+    assert mstore.get_active_version("t1", "eng", "doc1") is None
+    ids = vstore.list_point_ids_by_document("eng", "t1", "eng", "doc1", "v1")
+    retrieved = vstore._client.retrieve(collection_name="eng", ids=ids, with_payload=True)
+    assert all(p.payload["status"] == "deleted" for p in retrieved)
+
+
+def test_tighten_control_plane_fence_blocks_in_flight_update() -> None:
+    """ACL tightening advances the revision BEFORE data-plane propagation, so an
+    in-flight update job holding the pre-tighten ``base_revision`` cannot publish
+    a new version carrying the old ACL (build plan §10.7 / §10.10 #8)."""
+    mgr, mstore, _, _, ctx = _mgr_and_ctx()
+    _ingest_v1(mgr)
+    base = mstore.get_current_revision("t1", "eng", "doc1")
+    tight = ResourceAcl(
+        tenant_id="t1", security_level="public", acl_scope="restricted",
+        allowed_user_ids=["u1"], allowed_group_ids=[], denied_user_ids=[], denied_group_ids=[],
+    )
+    mgr.tighten_acl(ctx, corpus_id="eng", document_id="doc1", acl=tight)
+    # Stale in-flight update job attempts to commit v2 with the old base.
+    _make_v2_processing(mstore)
+    with pytest.raises(ActiveVersionConflict):
+        mstore.commit_active_version(
+            tenant_id="t1", corpus_id="eng", document_id="doc1",
+            new_version="v2", expected_revision=base,
+        )
+    # Active version keeps the tightened ACL; no resurrected v2.
+    assert mstore.get_active_version("t1", "eng", "doc1") == "v1"
+    doc = mstore.get_document("t1", "eng", "doc1", "v1")
+    assert doc.allowed_user_ids == ["u1"]
+    assert "u2" not in doc.allowed_user_ids
+
+
+def test_tighten_rejects_widening() -> None:
+    """``tighten_acl`` must reject ACL *widening* (build plan §10.7): it must not
+    add allowed principals or widen ``acl_scope``."""
+    mgr, _, _, _, ctx = _mgr_and_ctx()
+    _ingest_v1(mgr)  # restricted, allowed=['u1', 'u2']
+    # Adding a brand-new allowed user (u3) is a widening -> rejected.
+    wide = ResourceAcl(
+        tenant_id="t1", security_level="public", acl_scope="restricted",
+        allowed_user_ids=["u1", "u2", "u3"], allowed_group_ids=[],
+        denied_user_ids=[], denied_group_ids=[],
+    )
+    with pytest.raises(DocumentMutationError):
+        mgr.tighten_acl(ctx, corpus_id="eng", document_id="doc1", acl=wide)
+    # Restricted -> tenant also widens -> rejected.
+    wide2 = ResourceAcl(
+        tenant_id="t1", security_level="public", acl_scope="tenant",
+        allowed_user_ids=[], allowed_group_ids=[], denied_user_ids=[], denied_group_ids=[],
+    )
+    with pytest.raises(DocumentMutationError):
+        mgr.tighten_acl(ctx, corpus_id="eng", document_id="doc1", acl=wide2)
 
 
 def test_cross_tenant_mutation_is_refused() -> None:

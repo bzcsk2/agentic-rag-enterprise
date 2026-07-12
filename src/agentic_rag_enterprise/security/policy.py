@@ -134,6 +134,41 @@ def can_manage_document(ctx: SecurityContext, doc: SourceDocument) -> bool:
     return False
 
 
+# Canonical restrictiveness order for ``security_level`` (build plan §11.3). A
+# higher rank is MORE restrictive (fewer principals can read). Unknown levels
+# rank highest so a change toward an unknown level is treated as tightening and a
+# change away from one is rejected (fail-closed on widening).
+_SECURITY_LEVEL_ORDER: dict[str, int] = {"public": 0, "internal": 1, "secret": 2}
+
+
+def _security_level_rank(level: str) -> int:
+    return _SECURITY_LEVEL_ORDER.get(level, len(_SECURITY_LEVEL_ORDER))
+
+
+def is_acl_tightening(old: ResourceAcl, new: ResourceAcl) -> bool:
+    """Return True iff ``new`` is a *tightening* (never a widening) of ``old``.
+
+    A tightening reduces or preserves access: it must not add allowed principals,
+    must not remove denied principals, must not widen ``acl_scope`` (restricted ->
+    tenant), and must not lower the ``security_level`` restrictiveness (build
+    plan §10.7, "tightening is prioritized over widening"). Any widening is
+    rejected so ``tighten_acl`` cannot accidentally grant broader access.
+    """
+    if new.acl_scope == "tenant" and old.acl_scope == "restricted":
+        return False  # restricted -> tenant widens
+    if _security_level_rank(new.security_level) < _security_level_rank(old.security_level):
+        return False  # less restrictive security level widens
+    if not set(new.allowed_user_ids) <= set(old.allowed_user_ids):
+        return False  # added an allowed user widens
+    if not set(new.allowed_group_ids) <= set(old.allowed_group_ids):
+        return False
+    if not set(old.denied_user_ids) <= set(new.denied_user_ids):
+        return False  # removed a denied user widens
+    if not set(old.denied_group_ids) <= set(new.denied_group_ids):
+        return False
+    return True
+
+
 class AccessPolicy:
     """Retrieval-time access control.
 
