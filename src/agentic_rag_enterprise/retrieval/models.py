@@ -71,15 +71,47 @@ class RetrievalResult(BaseModel):
 
     hits: list[tuple[RetrievalHit, AuthorizedParent]] = Field(default_factory=list)
     denied_parent_count: int = 0
+    denied_reasons: dict[str, int] = Field(default_factory=dict)
 
 
 class ParentAuthorizationError(Exception):
-    """Raised when a parent fails the second authorization pass (fail closed)."""
+    """Raised when a parent fails the second authorization pass (fail closed).
+
+    Carries a build plan §12.9 ``code`` so callers can classify the denial for
+    telemetry WITHOUT leaking to the end user whether an unauthorized resource
+    exists. Base code is ``PARENT_NOT_AUTHORIZED``; subclasses refine it.
+    """
+
+    code = "PARENT_NOT_AUTHORIZED"
 
     def __init__(self, reason: str, parent_id: str = "") -> None:
         self.reason = reason
         self.parent_id = parent_id
         super().__init__(f"parent authorization failed for {parent_id or '<unknown>'}: {reason}")
+
+
+class ParentNotFoundError(ParentAuthorizationError):
+    """§12.9 ``PARENT_NOT_FOUND`` — parent id absent from the store."""
+
+    code = "PARENT_NOT_FOUND"
+
+
+class ParentNotAuthorizedError(ParentAuthorizationError):
+    """§12.9 ``PARENT_NOT_AUTHORIZED`` — identity/ACL/visibility denial."""
+
+    code = "PARENT_NOT_AUTHORIZED"
+
+
+class ParentDeletedError(ParentAuthorizationError):
+    """§12.9 ``DOCUMENT_DELETED`` — parent lifecycle not active / deprecated."""
+
+    code = "DOCUMENT_DELETED"
+
+
+class ParentVersionMismatchError(ParentAuthorizationError):
+    """§12.9 ``VERSION_MISMATCH`` — parent version diverges from the hit."""
+
+    code = "VERSION_MISMATCH"
 
 
 class CorpusNotDiscoverableError(Exception):

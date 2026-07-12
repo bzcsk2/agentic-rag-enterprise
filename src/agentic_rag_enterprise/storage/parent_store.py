@@ -24,7 +24,15 @@ class ParentStore:
         self._store[chunk.parent_id] = chunk
 
     def get(self, parent_id: str) -> ParentChunk | None:
-        """Raw, untrusted lookup. No authorization is performed here."""
+        """Raw, untrusted lookup. No authorization is performed here.
+
+        Internal accessor only. The retrieval/API surface MUST NOT call this
+        directly (build plan §12.5: no reading a parent by a model-supplied id);
+        the sole authorized retrieval accessor is
+        :class:`~agentic_rag_enterprise.retrieval.parent_reader.ParentReader`.
+        Enforced by ``tests/unit/test_retrieval_boundary.py``. (Ingestion's
+        verify/publish steps are a trusted control-plane caller.)
+        """
         return self._store.get(parent_id)
 
     def delete(self, parent_id: str) -> None:

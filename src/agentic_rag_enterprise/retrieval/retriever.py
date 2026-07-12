@@ -127,6 +127,7 @@ class SecureRetriever:
 
         hits: list[tuple] = []
         denied_count = 0
+        denied_reasons: dict[str, int] = {}
         for hit in child_hits:
             # Control-plane active-version gate (build plan §10.10 #5): drop
             # hits whose version is not the Metadata DB's current active version
@@ -139,12 +140,19 @@ class SecureRetriever:
                 continue
             try:
                 parent = self._parent_reader.load_parent_for_hit(hit, ctx)
-            except ParentAuthorizationError:
+            except ParentAuthorizationError as exc:
                 # A parent that fails the second-auth pass is simply not
                 # returned. Storage faults / programming errors are NOT masked
                 # as authorization denials and propagate for explicit handling.
+                # The §12.9 code is recorded for telemetry only; the user-facing
+                # result never carries per-parent existence detail.
                 denied_count += 1
+                denied_reasons[exc.code] = denied_reasons.get(exc.code, 0) + 1
                 continue
             hits.append((hit, parent))
 
-        return RetrievalResult(hits=hits, denied_parent_count=denied_count)
+        return RetrievalResult(
+            hits=hits,
+            denied_parent_count=denied_count,
+            denied_reasons=denied_reasons,
+        )

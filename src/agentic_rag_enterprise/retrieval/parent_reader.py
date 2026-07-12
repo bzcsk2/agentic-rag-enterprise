@@ -13,7 +13,10 @@ from typing import Any
 from agentic_rag_enterprise.domain.security import SecurityContext
 from agentic_rag_enterprise.retrieval.models import (
     AuthorizedParent,
-    ParentAuthorizationError,
+    ParentDeletedError,
+    ParentNotAuthorizedError,
+    ParentNotFoundError,
+    ParentVersionMismatchError,
     RetrievalHit,
     as_acl_scope,
 )
@@ -68,16 +71,16 @@ def _validate_parent_auth_metadata(md: dict[str, Any], parent_id: str) -> None:
     """Fail closed if the untrusted parent metadata lacks/mis-types auth data."""
     missing = _REQUIRED_PARENT_AUTH_FIELDS - md.keys()
     if missing:
-        raise ParentAuthorizationError(
+        raise ParentNotAuthorizedError(
             f"required authorization metadata missing: {sorted(missing)}",
             parent_id,
         )
     if not isinstance(md["status"], str):
-        raise ParentAuthorizationError("parent status must be a string", parent_id)
+        raise ParentNotAuthorizedError("parent status must be a string", parent_id)
     if not isinstance(md["deprecated"], bool):
-        raise ParentAuthorizationError("parent deprecated must be a boolean", parent_id)
+        raise ParentNotAuthorizedError("parent deprecated must be a boolean", parent_id)
     if md["acl_scope"] not in ("tenant", "restricted"):
-        raise ParentAuthorizationError("parent acl_scope must be tenant|restricted", parent_id)
+        raise ParentNotAuthorizedError("parent acl_scope must be tenant|restricted", parent_id)
     for key in (
         "allowed_user_ids",
         "allowed_group_ids",
@@ -86,7 +89,7 @@ def _validate_parent_auth_metadata(md: dict[str, Any], parent_id: str) -> None:
     ):
         value = md[key]
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-            raise ParentAuthorizationError(f"parent {key} must be a list of strings", parent_id)
+            raise ParentNotAuthorizedError(f"parent {key} must be a list of strings", parent_id)
 
 
 class ParentReader:
@@ -98,7 +101,7 @@ class ParentReader:
     def load_parent_for_hit(self, hit: RetrievalHit, ctx: SecurityContext) -> AuthorizedParent:
         parent = self._store.get(hit.parent_id)
         if parent is None:
-            raise ParentAuthorizationError(
+            raise ParentNotFoundError(
                 "parent id absent from store (guessed or untrusted id?)",
                 parent_id=hit.parent_id,
             )
@@ -107,15 +110,15 @@ class ParentReader:
         # (The child was already tenant-filtered by build_access_filter; this
         # re-verifies the stored parent has not diverged from the child.)
         if hit.tenant_id != parent.tenant_id:
-            raise ParentAuthorizationError("child/parent tenant mismatch", hit.parent_id)
+            raise ParentNotAuthorizedError("child/parent tenant mismatch", hit.parent_id)
         if parent.tenant_id != ctx.tenant_id:
-            raise ParentAuthorizationError("tenant mismatch", hit.parent_id)
+            raise ParentNotAuthorizedError("tenant mismatch", hit.parent_id)
         if parent.corpus_id != hit.corpus_id:
-            raise ParentAuthorizationError("corpus mismatch", hit.parent_id)
+            raise ParentNotAuthorizedError("corpus mismatch", hit.parent_id)
         if parent.document_id != hit.document_id:
-            raise ParentAuthorizationError("document identity mismatch", hit.parent_id)
+            raise ParentNotAuthorizedError("document identity mismatch", hit.parent_id)
         if parent.document_version != hit.document_version:
-            raise ParentAuthorizationError("document version mismatch", hit.parent_id)
+            raise ParentVersionMismatchError("document version mismatch", hit.parent_id)
 
         md = parent.metadata
         # The parent store is untrusted: require the full authorization metadata
@@ -126,7 +129,7 @@ class ParentReader:
 
         # Lifecycle gate.
         if status != "active" or deprecated:
-            raise ParentAuthorizationError(
+            raise ParentDeletedError(
                 f"parent lifecycle invalid (status={status}, deprecated={deprecated})",
                 hit.parent_id,
             )
@@ -151,12 +154,12 @@ class ParentReader:
             "denied_group_ids": hit.denied_group_ids,
         }
         if not _record_acl_equal(parent_acl_record, hit_acl_record):
-            raise ParentAuthorizationError("parent/child ACL mismatch", hit.parent_id)
+            raise ParentNotAuthorizedError("parent/child ACL mismatch", hit.parent_id)
 
         # Second authorization pass via the canonical PDP projection.
         acl = _acl_from_record(parent_acl_record, parent.tenant_id)
         if not resource_passes_filter(ctx, acl, status, deprecated):
-            raise ParentAuthorizationError("resource_passes_filter denied", hit.parent_id)
+            raise ParentNotAuthorizedError("resource_passes_filter denied", hit.parent_id)
 
         acl_scope = as_acl_scope(parent_acl_record["acl_scope"])
         security_level = str(parent_acl_record["security_level"])

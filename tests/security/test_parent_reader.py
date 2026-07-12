@@ -9,7 +9,14 @@ present in the store are rejected (no guessing).
 
 import pytest
 
-from agentic_rag_enterprise.retrieval.models import ParentAuthorizationError, RetrievalHit
+from agentic_rag_enterprise.retrieval.models import (
+    ParentAuthorizationError,
+    ParentDeletedError,
+    ParentNotAuthorizedError,
+    ParentNotFoundError,
+    ParentVersionMismatchError,
+    RetrievalHit,
+)
 from agentic_rag_enterprise.retrieval.parent_reader import ParentReader
 from agentic_rag_enterprise.storage.parent_store import ParentStore
 from tests.fixtures import (
@@ -248,3 +255,86 @@ def test_malformed_field_type_rejected(key: str, value: object) -> None:
     reader = ParentReader(_store_with_metadata(meta))
     with pytest.raises(ParentAuthorizationError):
         reader.load_parent_for_hit(_hit(), make_security_context())
+
+
+# --- E-009: §12.9 distinct failure semantics -------------------------------
+
+
+def test_not_found_raises_parent_not_found() -> None:
+    reader = ParentReader(_store_with_parent())
+    with pytest.raises(ParentNotFoundError) as exc:
+        reader.load_parent_for_hit(_hit(parent_id="deadbeefdeadbeef"), make_security_context())
+    assert exc.value.code == "PARENT_NOT_FOUND"
+
+
+def test_version_mismatch_raises_version_mismatch() -> None:
+    reader = ParentReader(_store_with_parent())
+    with pytest.raises(ParentVersionMismatchError) as exc:
+        reader.load_parent_for_hit(_hit(document_version="v2"), make_security_context())
+    assert exc.value.code == "VERSION_MISMATCH"
+
+
+@pytest.mark.parametrize("status_kwargs", [{"status": "deleted"}, {"deprecated": True}])
+def test_lifecycle_invalid_raises_document_deleted(status_kwargs: dict) -> None:
+    store = ParentStore()
+    store.put(
+        make_parent_chunk(
+            PARENT_ID,
+            "x",
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="d1",
+            document_version="v1",
+            acl=ACL,
+            **status_kwargs,
+        )
+    )
+    reader = ParentReader(store)
+    with pytest.raises(ParentDeletedError) as exc:
+        reader.load_parent_for_hit(_hit(), make_security_context())
+    assert exc.value.code == "DOCUMENT_DELETED"
+
+
+@pytest.mark.parametrize(
+    "hit_overrides",
+    [
+        {"tenant_id": "t2"},
+        {"corpus_id": "other"},
+        {"document_id": "d2"},
+        {"acl_scope": "restricted", "allowed_user_ids": ["u1"]},
+    ],
+)
+def test_identity_and_acl_denials_raise_not_authorized(hit_overrides: dict) -> None:
+    reader = ParentReader(_store_with_parent())
+    with pytest.raises(ParentNotAuthorizedError) as exc:
+        reader.load_parent_for_hit(_hit(**hit_overrides), make_security_context())
+    assert exc.value.code == "PARENT_NOT_AUTHORIZED"
+
+
+def test_resource_filter_deny_raises_not_authorized() -> None:
+    acl = acl_payload(tenant_id="t1", acl_scope="restricted", security_level="public")
+    store = ParentStore()
+    store.put(
+        make_parent_chunk(
+            PARENT_ID,
+            "x",
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="d1",
+            document_version="v1",
+            acl=acl,
+        )
+    )
+    reader = ParentReader(store)
+    with pytest.raises(ParentNotAuthorizedError) as exc:
+        reader.load_parent_for_hit(_hit(acl_scope="restricted"), make_security_context())
+    assert exc.value.code == "PARENT_NOT_AUTHORIZED"
+
+
+def test_missing_metadata_raises_not_authorized() -> None:
+    meta = _valid_parent_metadata()
+    del meta["status"]
+    reader = ParentReader(_store_with_metadata(meta))
+    with pytest.raises(ParentNotAuthorizedError) as exc:
+        reader.load_parent_for_hit(_hit(), make_security_context())
+    assert exc.value.code == "PARENT_NOT_AUTHORIZED"
