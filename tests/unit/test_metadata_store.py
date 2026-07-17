@@ -369,8 +369,7 @@ def test_migration_atomicity_rolls_back_on_failure(tmp_path) -> None:
     bad_dir = tmp_path / "migrations"
     bad_dir.mkdir()
     (bad_dir / "001_bad.sql").write_text(
-        "CREATE TABLE good_table (id INTEGER PRIMARY KEY);\n"
-        "THIS IS NOT VALID SQL;\n"
+        "CREATE TABLE good_table (id INTEGER PRIMARY KEY);\nTHIS IS NOT VALID SQL;\n"
     )
     db = tmp_path / "md.db"
     orig = ms.MIGRATIONS_DIR
@@ -389,8 +388,7 @@ def test_migration_atomicity_rolls_back_on_failure(tmp_path) -> None:
     # schema_migrations bookkeeping table was created (outside the transaction).
     store = MetadataStore(str(db))
     tables = {
-        r["name"]
-        for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        r["name"] for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert "good_table" not in tables
     assert "schema_migrations" in tables
@@ -694,9 +692,7 @@ def test_set_document_status_flips_and_records_deleted_at() -> None:
     store = MetadataStore(path)
     _seed_corpus(store)
     store.upsert_document(_make_doc(version="v1", status=DocumentStatus.ACTIVE))
-    store.set_document_status(
-        "t1", "eng", "d1", "v1", DocumentStatus.DELETED, deleted_at=_FIXED
-    )
+    store.set_document_status("t1", "eng", "d1", "v1", DocumentStatus.DELETED, deleted_at=_FIXED)
     doc = store.get_document("t1", "eng", "d1", "v1")
     assert doc is not None
     assert doc.status == DocumentStatus.DELETED
@@ -761,7 +757,10 @@ def test_update_document_acl_advances_lifecycle_revision_for_fencing() -> None:
         "AND document_id='d1' AND version='v1'"
     ).fetchone()["lifecycle_revision"]
     store.update_document_acl(
-        "t1", "eng", "d1", "v1",
+        "t1",
+        "eng",
+        "d1",
+        "v1",
         security_level="secret",
         acl_scope="restricted",
         allowed_user_ids=["u9"],
@@ -799,8 +798,11 @@ def test_logical_delete_advances_revision_blocks_stale_update() -> None:
     store.upsert_document(_make_doc(version="v2", status=DocumentStatus.PROCESSING))
     with pytest.raises(ActiveVersionConflict):
         store.commit_active_version(
-            tenant_id="t1", corpus_id="eng", document_id="d1",
-            new_version="v2", expected_revision=base,
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="d1",
+            new_version="v2",
+            expected_revision=base,
         )
     store.close()
     os.unlink(path)

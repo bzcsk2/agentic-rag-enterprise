@@ -50,8 +50,10 @@ def _hit_for(child, acl) -> RetrievalHit:
 
 def _setup():
     acl = acl_payload(
-        tenant_id="t1", acl_scope="restricted",
-        security_level="public", allowed_user_ids=["u1"],
+        tenant_id="t1",
+        acl_scope="restricted",
+        security_level="public",
+        allowed_user_ids=["u1"],
     )
     vstore, pstore, children = _ingest("eng", "t1", acl)
     mstore = active_metadata_store("t1", "eng", "doc1", "v1")
@@ -88,8 +90,13 @@ def test_deny_tightening_revokes_previously_authorized_user() -> None:
 
     # Tighten to restricted and deny u1 explicitly. No re-embedding occurs.
     tight = ResourceAcl(
-        tenant_id="t1", security_level="public", acl_scope="restricted",
-        allowed_user_ids=[], allowed_group_ids=[], denied_user_ids=["u1"], denied_group_ids=[],
+        tenant_id="t1",
+        security_level="public",
+        acl_scope="restricted",
+        allowed_user_ids=[],
+        allowed_group_ids=[],
+        denied_user_ids=["u1"],
+        denied_group_ids=[],
     )
     mgr.tighten_acl(ctx_u1, corpus_id="eng", document_id="doc1", acl=tight)
 

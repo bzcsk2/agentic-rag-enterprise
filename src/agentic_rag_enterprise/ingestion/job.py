@@ -202,9 +202,7 @@ class IngestionJob:
     # ------------------------------------------------------------------ #
     # Public entry point
     # ------------------------------------------------------------------ #
-    def run(
-        self, max_step: Optional[str] = None, recover: bool = False
-    ) -> IngestionResult:
+    def run(self, max_step: Optional[str] = None, recover: bool = False) -> IngestionResult:
         """Run steps up to and including ``max_step`` (None = all).
 
         A ``max_step`` shorter than the full pipeline simulates a crash/interrupt;
@@ -624,9 +622,7 @@ class IngestionJob:
                 or stored.document_version != self._req.document_version
                 or stored.parent_id != parent.parent_id
             ):
-                raise RuntimeError(
-                    f"verify failed: identity mismatch on parent {parent.parent_id}"
-                )
+                raise RuntimeError(f"verify failed: identity mismatch on parent {parent.parent_id}")
 
         # All expected Qdrant points exist WITH consistent identity (read the
         # payload back, not just column presence). Each point is compared
@@ -639,9 +635,7 @@ class IngestionJob:
                 collection_name=collection, ids=point_ids, with_payload=True
             )
             found_by_id = {str(p.id): p for p in found}
-            expected_by_point_id = {
-                child_point_id(c.child_id): c for c in self._children_list
-            }
+            expected_by_point_id = {child_point_id(c.child_id): c for c in self._children_list}
             missing = [pid for pid in point_ids if pid not in found_by_id]
             if missing:
                 raise RuntimeError(f"verify failed: {len(missing)} Qdrant point(s) missing")
@@ -650,9 +644,7 @@ class IngestionJob:
                 payload = p.payload or {}
                 child = expected_by_point_id.get(pid)
                 if child is None:
-                    raise RuntimeError(
-                        f"verify failed: unexpected Qdrant point {pid}"
-                    )
+                    raise RuntimeError(f"verify failed: unexpected Qdrant point {pid}")
                 if (
                     payload.get("tenant_id") != self._req.tenant_id
                     or payload.get("corpus_id") != self._req.corpus_id
@@ -663,9 +655,7 @@ class IngestionJob:
                     or payload.get("status") != "processing"
                     or payload.get("deprecated") is not False
                 ):
-                    raise RuntimeError(
-                        f"verify failed: identity mismatch on Qdrant point {pid}"
-                    )
+                    raise RuntimeError(f"verify failed: identity mismatch on Qdrant point {pid}")
 
         # Identity + count consistency against persisted chunk records.
         records = self._store.list_chunk_records(
@@ -968,16 +958,16 @@ class DocumentManager:
     # ------------------------------------------------------------------ #
     # Document mutation (build plan §10.4 / §10.6 / §10.7 / §3530)
     # ------------------------------------------------------------------ #
-    def _resolve_active(self, ctx: SecurityContext, corpus_id: str, document_id: str) -> SourceDocument:
+    def _resolve_active(
+        self, ctx: SecurityContext, corpus_id: str, document_id: str
+    ) -> SourceDocument:
         doc = self._store.get_active_document(ctx.tenant_id, corpus_id, document_id)
         if doc is None:
             raise DocumentMutationError(
                 f"no active document {document_id!r} in corpus {corpus_id!r}"
             )
         if not can_manage_document(ctx, doc):
-            raise DocumentMutationError(
-                f"caller not authorized to mutate document {document_id!r}"
-            )
+            raise DocumentMutationError(f"caller not authorized to mutate document {document_id!r}")
         return doc
 
     def update(
@@ -1038,13 +1028,9 @@ class DocumentManager:
         """
         doc = self._store.get_document_latest(ctx.tenant_id, corpus_id, document_id)
         if doc is None:
-            raise DocumentMutationError(
-                f"no document {document_id!r} in corpus {corpus_id!r}"
-            )
+            raise DocumentMutationError(f"no document {document_id!r} in corpus {corpus_id!r}")
         if not can_manage_document(ctx, doc):
-            raise DocumentMutationError(
-                f"caller not authorized to mutate document {document_id!r}"
-            )
+            raise DocumentMutationError(f"caller not authorized to mutate document {document_id!r}")
         if doc.status == DocumentStatus.DELETED:
             return  # already logically deleted: idempotent no-op
         version = doc.version
@@ -1078,9 +1064,7 @@ class DocumentManager:
         if doc is None:
             return  # already purged: idempotent no-op
         if not can_manage_document(ctx, doc):
-            raise DocumentMutationError(
-                f"caller not authorized to purge document {document_id!r}"
-            )
+            raise DocumentMutationError(f"caller not authorized to purge document {document_id!r}")
         if doc.status != DocumentStatus.DELETED:
             raise DocumentMutationError(
                 f"refuse to purge non-deleted document {document_id!r}; call delete() first"
@@ -1133,7 +1117,10 @@ class DocumentManager:
         #    job holding an older base_revision fails its commit CAS and cannot
         #    publish a new version carrying the pre-tighten ACL.
         self._store.update_document_acl(
-            doc.tenant_id, corpus_id, document_id, version,
+            doc.tenant_id,
+            corpus_id,
+            document_id,
+            version,
             security_level=acl.security_level,
             acl_scope=acl.acl_scope,
             allowed_user_ids=acl.allowed_user_ids,

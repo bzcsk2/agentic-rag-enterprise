@@ -62,18 +62,27 @@ def test_update_payload_patches_without_reembedding() -> None:
     encoder = _CountingDenseEncoder()
     point = child_chunk_to_point(
         ChildChunk(
-            child_id="c1", parent_id="p", document_id="d1",
-            document_version="v1", tenant_id="t1", corpus_id="eng", text="x",
+            child_id="c1",
+            parent_id="p",
+            document_id="d1",
+            document_version="v1",
+            tenant_id="t1",
+            corpus_id="eng",
+            text="x",
         ),
         ResourceAcl(**acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")),
-        status="active", deprecated=False, dense_encoder=encoder, sparse_encoder=FakeSparseEncoder(),
+        status="active",
+        deprecated=False,
+        dense_encoder=encoder,
+        sparse_encoder=FakeSparseEncoder(),
     )
     store.upsert("eng", [point])
     calls_after_upsert = encoder.calls
 
     # ACL tightening: patch only ACL fields.
     store.update_payload(
-        "eng", [str(point.id)],
+        "eng",
+        [str(point.id)],
         {"acl_scope": "restricted", "allowed_user_ids": ["u2"]},
     )
 

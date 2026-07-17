@@ -19,14 +19,15 @@
   retrieval fault is never relabelled as "no answer". Full contract at
   `docs/issue-e012-contract.md`.
 - Issue: **E-013** — AnswerEnvelope, citation rendering, single key-claim support
-  verification, and conservative refusal — implemented in the current change set
-  (additive; no E-011/E-012 behaviour changed). Adds `answer/`: `AnswerEnvelope` (frozen,
-  validated — no dangling citation, `abstained` state locked), `Claim`/`Citation` models,
-  `render_citations`/`format_citation_panel` (immutable snapshot refs), `verify_claims`
-  (deterministic single-pass: unsupported claims removed, critical removal downgrades
-  `completeness` to `partial`), and `build_answer_envelope`/`conservative_refusal` driven by
-  the E-012 `FastPathResult` (insufficient ⇒ abstained refusal with no fabricated facts).
-  Full contract at `docs/issue-e013-contract.md`.
+  verification, and conservative refusal — implemented and in acceptance remediation
+  (4 P1 fixes applied: fail-closed tenant/corpus binding via `TenantBindingError`;
+  unsupported / evidence-less / unresolved claims removed and their facts excluded from
+  `answer_markdown`; `Claim`/`Citation` frozen + validator checks `Citation.evidence_id`;
+  `conservative_refusal` rejects a `sufficient` result and the envelope locks
+  `abstained` ⇒ `stop_reason == no_evidence`). Adds `answer/`: `AnswerEnvelope` (deeply
+  frozen, validated), `Claim`/`Citation` (frozen), `render_citations`/`format_citation_panel`
+  (immutable snapshot refs), `verify_claims`, `build_answer_envelope`/`conservative_refusal`
+  driven by the E-012 `FastPathResult`. Full contract at `docs/issue-e013-contract.md`.
 - Next issue: **E-014** — shared chat application service, synchronous `/v1/chat` contract,
   and a minimal Gradio adapter. Wires the LLM that produces `answer_markdown` + `claims`
   consumed by E-013; must NOT start until E-013 is accepted.

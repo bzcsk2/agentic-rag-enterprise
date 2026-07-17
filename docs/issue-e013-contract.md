@@ -37,32 +37,48 @@ claim decomposition / Judge calibration / auto-rewrite are explicitly deferred.
 - **build plan §16.5 / §16.6** — citation format + immutable references.
 
 ## in_scope
+- **Tenant binding (fail-closed)** — `build_answer_envelope` / `conservative_refusal`
+  assert `ctx.tenant_id == result.tenant_id` and that every cited Evidence
+  snapshot's `tenant_id`/`corpus_id` matches the result (build plan §12.8 / M2
+  single-tenant invariant). A mismatch raises `TenantBindingError`; cross-tenant
+  Evidence can never be wrapped by another tenant's Context.
 - Typed `AnswerEnvelope` (build plan §7.9, single-corpus/single-iteration
   slice) with `request_id`/`session_id` from the `SecurityContext`, the
   `evidence` snapshots, `claims`, `completeness`, `confidence`,
   `missing_aspects`, `limitations`, `corpora_used`, `iterations` (=1),
   `tool_calls` (=1), `stop_reason`, `abstained`.
-- Typed `Claim` (claim_id, text, importance, evidence_ids, support_status) and
-  `Citation` (1-based UI index + immutable source refs).
+- Typed, **frozen** `Claim` (claim_id, text, importance, `evidence_ids` as an
+  immutable tuple, support_status) and **frozen** `Citation` (1-based UI index +
+  immutable source refs).
 - **Citation rendering** — `render_citations(evidence)` maps each E-011
   snapshot to a `Citation` carrying `corpus_id`, `document_id`, `document_version`,
   `section_path`, `page_number`, `source_uri`, `text_hash`, `retrieved_at`,
   `policy_version`; `format_citation_panel` emits the UI `[n] …` list. Every
-  citation is resolvable to a snapshot; no dangling citation is allowed.
+  citation is resolvable to a snapshot; no dangling citation is allowed (the
+  envelope validator checks `Citation.evidence_id` too).
 - **Single key-claim support verification** — `verify_claims(claims, evidence)`
-  deterministically (a) marks any claim whose `evidence_ids` do not all resolve
-  to the used Evidence as `unsupported`, (b) removes every `unsupported` claim
-  from the final answer, and (c) records whether a *critical* claim was removed
-  (used to downgrade `completeness` to `partial`). No LLM Judge, no
-  regeneration loop (those are deferred).
-- **Conservative refusal** — when `FastPathResult.should_abstain`, build an
+  deterministically treats a claim as `unsupported` (and removes it from the
+  final answer) when ANY of: its `support_status` is already `unsupported`; it
+  carries no `evidence_ids`; or any `evidence_ids` entry fails to resolve to the
+  used Evidence. A removed *critical* claim is recorded so `completeness` is
+  downgraded to `partial`. No LLM Judge, no regeneration loop (those are
+  deferred).
+- **Unsupported claims never reach the final answer** — when `claims` are
+  supplied, `build_answer_envelope` renders `answer_markdown` from the *kept*
+  (supported) claims only (`_render_answer_from_claims`), so an unsupported
+  claim's fact cannot appear in the answer text; the caller's prose is used only
+  as a fallback when no claims are supplied.
+- **Conservative refusal** — when `FastPathResult` is `insufficient`, build an
   `abstained` envelope: empty `claims`, empty `evidence`, `completeness ==
-  insufficient`, `confidence == low`, a fixed generic refusal string that
-  mentions no document name or content, and `stop_reason == no_evidence`. No
-  fabricated facts are produced.
+  insufficient`, `confidence == low`, `stop_reason == no_evidence`, and a fixed
+  generic refusal string that mentions no document name or content. No
+  fabricated facts are produced. `conservative_refusal` raises
+  `AnswerEnvelopeError` if called with a `sufficient` result.
 - A `model_validator` on `AnswerEnvelope` locks the state combinations (no
-  dangling citation; `abstained` ⇒ empty claims/evidence + `insufficient`;
-  `insufficient` ⇒ `abstained`), mirroring the E-012 validated-model approach.
+  dangling claim/citation id; `abstained` ⇒ empty claims/evidence +
+  `completeness == insufficient` + `stop_reason == no_evidence`;
+  `insufficient`/`no_evidence` ⇒ `abstained`), mirroring the E-012 validated-model
+  approach.
 
 ## deferred_to
 - **E-014** — the shared chat application service + LLM synthesis that produces
@@ -100,11 +116,17 @@ claim decomposition / Judge calibration / auto-rewrite are explicitly deferred.
   E-014). E-013 accepts `answer_markdown` and `claims` as inputs.
 - No reuse of `schemas.GroundedAnswer` / `schemas.Evidence` (M0 mocks) as the
   E-013 output type; the real `AnswerEnvelope` / E-011 `Evidence` are used.
+- No cross-tenant / cross-corpus wrapping: a `tenant-a` Context must never wrap
+  `tenant-b` Evidence (fail-closed `TenantBindingError`).
 - No multi-model Judge, claim decomposition, calibration, or regeneration loop.
-- No Fabricated facts on the abstain path; the refusal string must not reveal
+- No fabricated facts on the abstain path; the refusal string must not reveal
   document names or content (build plan §16.2).
-- No dangling citation: every `Claim.evidence_ids` entry must resolve to an
-  Evidence Snapshot in the envelope (validator enforces this).
+- No unsupported claim in the final answer: an `unsupported`/evidence-less claim
+  is removed and its fact must not appear in `answer_markdown`; `Claim` and
+  `Citation` are frozen and may not be mutated after construction.
+- No dangling citation: every `Claim.evidence_ids` entry and every
+  `Citation.evidence_id` must resolve to an Evidence Snapshot in the envelope
+  (validator enforces this).
 - No Planner / Typed DAG / multi-corpus / multi-hop.
 - No modification of E-011 or E-012 behaviour.
 - No reserved/placeholder modules, DB tables, or runtime branches not exercised
@@ -119,23 +141,34 @@ claim decomposition / Judge calibration / auto-rewrite are explicitly deferred.
     `tool_calls == 1`, `corpora_used == [corpus_id]`, and every rendered
     citation resolvable to a snapshot (carries `document_version`/`text_hash`/
     `policy_version`).
-  - `test_insufficient_path_produces_abstained_refusal`: a `should_abstain`
+  - `test_insufficient_path_produces_abstained_refusal`: an `insufficient`
     `FastPathResult` → `abstained is True`, `claims == []`, `evidence == []`,
     `completeness == insufficient`, `confidence == low`, `stop_reason ==
     no_evidence`, refusal string contains no document name/content and no
     fabricated fact.
-  - `test_dangling_citation_rejected`: a `Claim` referencing an `evidence_id`
-    absent from the evidence set fails envelope validation (`ValueError`).
-  - `test_unsupported_critical_claim_removed_and_downgraded`:
-    `verify_claims` marks an unresolved critical claim `unsupported` and removes
-    it; `build_answer_envelope` downgrades `completeness` to `partial`.
-  - `test_abstained_envelope_state_locked`: constructing an `abstained`
-    envelope that nevertheless carries claims/evidence raises `ValueError`.
+  - `test_tenant_mismatch_between_ctx_and_result_rejected` /
+    `test_cross_tenant_evidence_rejected` / `test_cross_corpus_evidence_rejected`:
+    any tenant/corpus mismatch raises `TenantBindingError` (fail-closed).
+  - `test_explicitly_unsupported_claim_removed` /
+    `test_critical_claim_with_empty_evidence_downgraded_and_removed` /
+    `test_dangling_evidence_id_claim_removed`: unsupported / evidence-less /
+    unresolved claims are removed and their facts never appear in
+    `answer_markdown`; a removed critical claim downgrades `completeness` to
+    `partial`.
+  - `test_claim_and_citation_are_frozen` / `test_dangling_claim_rejected_by_validator`
+    / `test_dangling_citation_rejected_by_validator`: `Claim`/`Citation` are
+    frozen (no post-construction mutation) and both claim and citation ids must
+    resolve to an Evidence Snapshot.
+  - `test_conservative_refusal_rejects_sufficient_result` /
+    `test_abstained_envelope_state_locked`: `conservative_refusal` rejects a
+    `sufficient` result; an `abstained` envelope must be locked to empty
+    claims/evidence + `completeness == insufficient` + `stop_reason == no_evidence`.
 - Regression that MUST stay green: E-011 (`tests/unit/test_deduplication.py`,
   `tests/unit/test_evidence_store.py`, `tests/integration/test_e011_evidence_pipeline.py`),
   E-012 (`tests/unit/test_fast_path.py`), `tests/unit/test_retrieval_boundary.py`,
   `tests/baseline/`.
-- Quality gates: `ruff check`, `ruff format --check`, `mypy src/agentic_rag_enterprise`,
+- Quality gates: `ruff check`, `ruff format --check` (whole tree, incl. the 9
+  pre-existing files now reformatted), `mypy src/agentic_rag_enterprise`,
   `git diff --check` all clean.
 
 ## acceptance_commands

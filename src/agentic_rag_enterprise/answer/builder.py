@@ -5,14 +5,24 @@ a typed, validated :class:`AnswerEnvelope`, rendering immutable citations from
 the E-011 Evidence Snapshots and running the single deterministic key-claim
 support check. When the E-012 Fast Path says ``insufficient`` it produces a
 conservative refusal envelope with no fabricated facts.
+
+Safety invariants enforced here (fail-closed):
+* the ``SecurityContext`` tenant must match the ``FastPathResult`` tenant and
+  the tenant/corpus of every cited Evidence (no cross-tenant leakage);
+* unsupported claims never reach the final answer — when claims are supplied the
+  answer text is rendered from the *kept* (supported) claims, so an unsupported
+  claim's fact cannot appear in the answer;
+* ``conservative_refusal`` only accepts an ``insufficient`` result.
 """
 
 from agentic_rag_enterprise.answer.citations import render_citations
 from agentic_rag_enterprise.answer.envelope import (
     AnswerEnvelope,
+    AnswerEnvelopeError,
     Claim,
     Completeness,
     Confidence,
+    TenantBindingError,
 )
 from agentic_rag_enterprise.answer.verification import verify_claims
 from agentic_rag_enterprise.domain.security import SecurityContext
@@ -28,6 +38,37 @@ _ABSTAIN_MESSAGE = (
 )
 
 
+def _check_tenant_binding(ctx: SecurityContext, result: FastPathResult) -> None:
+    """Fail-closed cross-tenant guard (build plan §12.8 / M2 single-tenant)."""
+    if ctx.tenant_id != result.tenant_id:
+        raise TenantBindingError(
+            f"SecurityContext tenant {ctx.tenant_id!r} does not match "
+            f"FastPathResult tenant {result.tenant_id!r}"
+        )
+    for ev in result.evidence:
+        if ev.tenant_id != ctx.tenant_id:
+            raise TenantBindingError(
+                f"Evidence {ev.evidence_id!r} belongs to tenant {ev.tenant_id!r}, "
+                f"not {ctx.tenant_id!r}"
+            )
+        if ev.corpus_id != result.corpus_id:
+            raise TenantBindingError(
+                f"Evidence {ev.evidence_id!r} belongs to corpus {ev.corpus_id!r}, "
+                f"not {result.corpus_id!r}"
+            )
+
+
+def _render_answer_from_claims(claims: list[Claim]) -> str:
+    """Render the answer text from the kept (supported) claims only.
+
+    Deriving the answer from the kept claims guarantees that an unsupported
+    claim's fact can never appear in the final answer (build plan §16.4).
+    """
+    if not claims:
+        return "No supported claim could be established from the available evidence."
+    return "\n".join(claim.text for claim in claims)
+
+
 def build_answer_envelope(
     fast_path_result: FastPathResult,
     ctx: SecurityContext,
@@ -41,15 +82,23 @@ def build_answer_envelope(
         fast_path_result: The E-012 one-pass decision (carries the Evidence and
             the ``should_abstain`` signal).
         ctx: The runtime-injected security context (supplies ``request_id`` /
-            ``session_id``).
-        answer_markdown: The caller-supplied grounded answer text. E-013 does
-            NOT generate it (LLM synthesis is wired by the E-014 service).
+            ``session_id`` and the tenant binding).
+        answer_markdown: Caller-supplied grounded answer text. When ``claims`` are
+            supplied this is used only as a fallback if no claim survives
+            verification; the final answer is otherwise rendered from the kept
+            claims so unsupported facts cannot leak through.
         claims: The caller-supplied atomic claims to verify and cite.
 
     Returns:
         A frozen, validated :class:`AnswerEnvelope`. On the ``insufficient``
         branch a conservative refusal envelope is returned instead.
+
+    Raises:
+        TenantBindingError: if the context/result/evidence tenants or corpus do
+            not match (fail-closed).
     """
+    _check_tenant_binding(ctx, fast_path_result)
+
     if fast_path_result.sufficiency is FastPathSufficiency.INSUFFICIENT:
         return conservative_refusal(fast_path_result, ctx)
 
@@ -66,10 +115,17 @@ def build_answer_envelope(
         completeness = "complete"
         confidence = "high"
 
+    # Derive the final answer from the kept claims so unsupported facts cannot
+    # enter the final answer; fall back to the caller text only when no claims
+    # were supplied to verify against.
+    final_answer = (
+        _render_answer_from_claims(verification.kept_claims) if claims else answer_markdown
+    )
+
     return AnswerEnvelope(
         request_id=ctx.request_id,
         session_id=ctx.session_id,
-        answer_markdown=answer_markdown,
+        answer_markdown=final_answer,
         claims=tuple(verification.kept_claims),
         evidence=tuple(evidence),
         citations=tuple(citations),
@@ -87,7 +143,18 @@ def conservative_refusal(
     fast_path_result: FastPathResult,
     ctx: SecurityContext,
 ) -> AnswerEnvelope:
-    """Build an abstained refusal envelope for an ``insufficient`` Fast Path result."""
+    """Build an abstained refusal envelope for an ``insufficient`` Fast Path result.
+
+    Raises:
+        AnswerEnvelopeError: if called with a ``sufficient`` result (the refusal
+            contract requires an ``insufficient`` decision, locking
+            ``abstained`` to ``stop_reason == no_evidence``).
+        TenantBindingError: if the context/result tenants do not match.
+    """
+    _check_tenant_binding(ctx, fast_path_result)
+    if fast_path_result.sufficiency is not FastPathSufficiency.INSUFFICIENT:
+        raise AnswerEnvelopeError("conservative_refusal requires an insufficient FastPathResult")
+
     return AnswerEnvelope(
         request_id=ctx.request_id,
         session_id=ctx.session_id,

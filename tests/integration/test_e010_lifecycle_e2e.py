@@ -5,7 +5,6 @@ using the real ``DocumentManager`` mutation API over the real Qdrant + parent +
 metadata stores.
 """
 
-
 from agentic_rag_enterprise.ingestion.chunker import ParentChildChunker
 from agentic_rag_enterprise.ingestion.job import DocumentManager, IngestionRequest
 from agentic_rag_enterprise.retrieval.hybrid import _HybridSearchAdapter
@@ -42,8 +41,10 @@ def _retriever(vstore, pstore, mstore) -> SecureRetriever:
 
 def test_lifecycle_ingest_retrieve_update_delete_purge_reingest() -> None:
     acl = acl_payload(
-        tenant_id="t1", acl_scope="restricted",
-        security_level="public", allowed_user_ids=["u1"],
+        tenant_id="t1",
+        acl_scope="restricted",
+        security_level="public",
+        allowed_user_ids=["u1"],
     )
     vstore, pstore, _ = _ingest("eng", "t1", acl)
     mstore = active_metadata_store("t1", "eng", "doc1", "v1")
@@ -53,19 +54,31 @@ def test_lifecycle_ingest_retrieve_update_delete_purge_reingest() -> None:
 
     # ingest -> retrieve (v1 present)
     res = retriever.retrieve(
-        ctx, "architecture planner security", _corpus(), dense_encoder=FakeDenseEncoder(), sparse_encoder=FakeSparseEncoder()
+        ctx,
+        "architecture planner security",
+        _corpus(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
     )
     assert res.hits
     assert all(v == "v1" for _, h in res.hits for v in [h.document_version])
 
     # update -> new active version, old deprecated
     mgr.update(
-        ctx, corpus_id="eng", document_id="doc1",
-        content="updated content for the system", job_id="j-upd", document_version="v2",
+        ctx,
+        corpus_id="eng",
+        document_id="doc1",
+        content="updated content for the system",
+        job_id="j-upd",
+        document_version="v2",
         acl=ResourceAcl(**acl),
     )
     res2 = retriever.retrieve(
-        ctx, "architecture planner security", _corpus(), dense_encoder=FakeDenseEncoder(), sparse_encoder=FakeSparseEncoder()
+        ctx,
+        "architecture planner security",
+        _corpus(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
     )
     assert res2.hits
     assert all(h.document_version == "v2" for _, h in res2.hits)
@@ -73,7 +86,11 @@ def test_lifecycle_ingest_retrieve_update_delete_purge_reingest() -> None:
     # logical delete -> immediate retrieval filter (no background purge needed)
     mgr.delete(ctx, corpus_id="eng", document_id="doc1")
     res3 = retriever.retrieve(
-        ctx, "anything", _corpus(), dense_encoder=FakeDenseEncoder(), sparse_encoder=FakeSparseEncoder()
+        ctx,
+        "anything",
+        _corpus(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
     )
     assert res3.hits == []
 
@@ -84,13 +101,21 @@ def test_lifecycle_ingest_retrieve_update_delete_purge_reingest() -> None:
     # re-ingest fresh on the same stores
     mgr.ingest(
         IngestionRequest(
-            tenant_id="t1", corpus_id="eng", document_id="doc1",
-            document_version="v3", content="brand new content for the system",
-            acl=ResourceAcl(**acl), job_id="j-re",
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="doc1",
+            document_version="v3",
+            content="brand new content for the system",
+            acl=ResourceAcl(**acl),
+            job_id="j-re",
         )
     )
     res4 = retriever.retrieve(
-        ctx, "anything", _corpus(), dense_encoder=FakeDenseEncoder(), sparse_encoder=FakeSparseEncoder()
+        ctx,
+        "anything",
+        _corpus(),
+        dense_encoder=FakeDenseEncoder(),
+        sparse_encoder=FakeSparseEncoder(),
     )
     assert res4.hits
     assert all(h.document_version == "v3" for _, h in res4.hits)

@@ -76,13 +76,20 @@ def _mgr_and_ctx():
 def _ingest_v1(mgr: DocumentManager) -> None:
     acl = ResourceAcl(
         **acl_payload(
-            tenant_id="t1", acl_scope="restricted",
-            security_level="public", allowed_user_ids=["u1", "u2"],
+            tenant_id="t1",
+            acl_scope="restricted",
+            security_level="public",
+            allowed_user_ids=["u1", "u2"],
         )
     )
     req = IngestionRequest(
-        tenant_id="t1", corpus_id="eng", document_id="doc1",
-        document_version="v1", content=SAMPLE_MARKDOWN, acl=acl, job_id="j-init",
+        tenant_id="t1",
+        corpus_id="eng",
+        document_id="doc1",
+        document_version="v1",
+        content=SAMPLE_MARKDOWN,
+        acl=acl,
+        job_id="j-init",
     )
     mgr.ingest(req)
 
@@ -97,8 +104,13 @@ def test_update_creates_new_active_version_and_deprecates_old() -> None:
     assert mstore.get_active_version("t1", "eng", "doc1") == "v1"
 
     mgr.update(
-        ctx, corpus_id="eng", document_id="doc1",
-        content="updated content", job_id="j-upd", document_version="v2", acl=_acl(),
+        ctx,
+        corpus_id="eng",
+        document_id="doc1",
+        content="updated content",
+        job_id="j-upd",
+        document_version="v2",
+        acl=_acl(),
     )
     assert mstore.get_active_version("t1", "eng", "doc1") == "v2"
     assert mstore.get_document("t1", "eng", "doc1", "v1").status == DocumentStatus.DEPRECATED
@@ -117,7 +129,9 @@ def test_delete_logical_flips_three_planes_and_is_idempotent() -> None:
     ids = vstore.list_point_ids_by_document("eng", "t1", "eng", "doc1", "v1")
     assert ids
     retrieved = vstore._client.retrieve(collection_name="eng", ids=ids, with_payload=True)
-    assert all(p.payload["status"] == "deleted" and p.payload["deprecated"] is True for p in retrieved)
+    assert all(
+        p.payload["status"] == "deleted" and p.payload["deprecated"] is True for p in retrieved
+    )
     # Idempotent re-run is a no-op (no error).
     mgr.delete(ctx, corpus_id="eng", document_id="doc1")
 
@@ -147,8 +161,13 @@ def test_tighten_acl_patches_payloads_without_reembedding() -> None:
     _ingest_v1(mgr)  # restricted, allowed=['u1', 'u2']
     # Genuine tightening: remove u2 (allowed set shrinks) — no re-embedding.
     tight = ResourceAcl(
-        tenant_id="t1", security_level="public", acl_scope="restricted",
-        allowed_user_ids=["u1"], allowed_group_ids=[], denied_user_ids=[], denied_group_ids=[],
+        tenant_id="t1",
+        security_level="public",
+        acl_scope="restricted",
+        allowed_user_ids=["u1"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
     )
     mgr.tighten_acl(ctx, corpus_id="eng", document_id="doc1", acl=tight)
 
@@ -168,15 +187,33 @@ def _make_v2_processing(mstore: MetadataStore) -> None:
     (status=processing) and is about to call ``commit_active_version``."""
     mstore.upsert_document(
         SourceDocument(
-            document_id="doc1", tenant_id="t1", corpus_id="eng",
-            source_uri="inline://doc1", source_connector="file", title="doc1",
-            source_filename="doc1.md", mime_type="text/markdown", version="v2",
-            content_hash="def", status=DocumentStatus.PROCESSING, authority_level=50,
-            deprecated=False, acl_policy_id="default", security_level="public",
-            acl_scope="restricted", allowed_user_ids=["u1"], allowed_group_ids=[],
-            denied_user_ids=[], denied_group_ids=[], parser_name="markdown",
-            parser_version="1.0", chunking_version="1.0", embedding_model="fake",
-            embedding_version="1.0", discovered_at=_TS, last_synced_at=_TS,
+            document_id="doc1",
+            tenant_id="t1",
+            corpus_id="eng",
+            source_uri="inline://doc1",
+            source_connector="file",
+            title="doc1",
+            source_filename="doc1.md",
+            mime_type="text/markdown",
+            version="v2",
+            content_hash="def",
+            status=DocumentStatus.PROCESSING,
+            authority_level=50,
+            deprecated=False,
+            acl_policy_id="default",
+            security_level="public",
+            acl_scope="restricted",
+            allowed_user_ids=["u1"],
+            allowed_group_ids=[],
+            denied_user_ids=[],
+            denied_group_ids=[],
+            parser_name="markdown",
+            parser_version="1.0",
+            chunking_version="1.0",
+            embedding_model="fake",
+            embedding_version="1.0",
+            discovered_at=_TS,
+            last_synced_at=_TS,
         )
     )
 
@@ -194,8 +231,11 @@ def test_delete_control_plane_fence_blocks_in_flight_update() -> None:
     _make_v2_processing(mstore)
     with pytest.raises(ActiveVersionConflict):
         mstore.commit_active_version(
-            tenant_id="t1", corpus_id="eng", document_id="doc1",
-            new_version="v2", expected_revision=base,
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="doc1",
+            new_version="v2",
+            expected_revision=base,
         )
     # No active version; the deleted v1 Qdrant points are already flipped.
     assert mstore.get_active_version("t1", "eng", "doc1") is None
@@ -212,16 +252,24 @@ def test_tighten_control_plane_fence_blocks_in_flight_update() -> None:
     _ingest_v1(mgr)
     base = mstore.get_current_revision("t1", "eng", "doc1")
     tight = ResourceAcl(
-        tenant_id="t1", security_level="public", acl_scope="restricted",
-        allowed_user_ids=["u1"], allowed_group_ids=[], denied_user_ids=[], denied_group_ids=[],
+        tenant_id="t1",
+        security_level="public",
+        acl_scope="restricted",
+        allowed_user_ids=["u1"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
     )
     mgr.tighten_acl(ctx, corpus_id="eng", document_id="doc1", acl=tight)
     # Stale in-flight update job attempts to commit v2 with the old base.
     _make_v2_processing(mstore)
     with pytest.raises(ActiveVersionConflict):
         mstore.commit_active_version(
-            tenant_id="t1", corpus_id="eng", document_id="doc1",
-            new_version="v2", expected_revision=base,
+            tenant_id="t1",
+            corpus_id="eng",
+            document_id="doc1",
+            new_version="v2",
+            expected_revision=base,
         )
     # Active version keeps the tightened ACL; no resurrected v2.
     assert mstore.get_active_version("t1", "eng", "doc1") == "v1"
@@ -237,16 +285,25 @@ def test_tighten_rejects_widening() -> None:
     _ingest_v1(mgr)  # restricted, allowed=['u1', 'u2']
     # Adding a brand-new allowed user (u3) is a widening -> rejected.
     wide = ResourceAcl(
-        tenant_id="t1", security_level="public", acl_scope="restricted",
-        allowed_user_ids=["u1", "u2", "u3"], allowed_group_ids=[],
-        denied_user_ids=[], denied_group_ids=[],
+        tenant_id="t1",
+        security_level="public",
+        acl_scope="restricted",
+        allowed_user_ids=["u1", "u2", "u3"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
     )
     with pytest.raises(DocumentMutationError):
         mgr.tighten_acl(ctx, corpus_id="eng", document_id="doc1", acl=wide)
     # Restricted -> tenant also widens -> rejected.
     wide2 = ResourceAcl(
-        tenant_id="t1", security_level="public", acl_scope="tenant",
-        allowed_user_ids=[], allowed_group_ids=[], denied_user_ids=[], denied_group_ids=[],
+        tenant_id="t1",
+        security_level="public",
+        acl_scope="tenant",
+        allowed_user_ids=[],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
     )
     with pytest.raises(DocumentMutationError):
         mgr.tighten_acl(ctx, corpus_id="eng", document_id="doc1", acl=wide2)
@@ -260,13 +317,19 @@ def test_cross_tenant_mutation_is_refused() -> None:
         mgr.delete(other, corpus_id="eng", document_id="doc1")
     with pytest.raises(DocumentMutationError):
         mgr.tighten_acl(
-            other, corpus_id="eng", document_id="doc1",
+            other,
+            corpus_id="eng",
+            document_id="doc1",
             acl=ResourceAcl(tenant_id="t1", security_level="public", acl_scope="tenant"),
         )
     with pytest.raises(DocumentMutationError):
         mgr.update(
-            other, corpus_id="eng", document_id="doc1",
-            content="x", job_id="jx", document_version="v2",
+            other,
+            corpus_id="eng",
+            document_id="doc1",
+            content="x",
+            job_id="jx",
+            document_version="v2",
         )
 
 
@@ -280,12 +343,15 @@ def test_non_discoverable_corpus_mutation_is_refused() -> None:
 
 def _ingest_tenant_scoped(mgr: DocumentManager) -> None:
     """A tenant-scoped (readable by every tenant member) but owner-less document."""
-    acl = ResourceAcl(
-        **acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public")
-    )
+    acl = ResourceAcl(**acl_payload(tenant_id="t1", acl_scope="tenant", security_level="public"))
     req = IngestionRequest(
-        tenant_id="t1", corpus_id="eng", document_id="doc2",
-        document_version="v1", content=SAMPLE_MARKDOWN, acl=acl, job_id="j-init2",
+        tenant_id="t1",
+        corpus_id="eng",
+        document_id="doc2",
+        document_version="v1",
+        content=SAMPLE_MARKDOWN,
+        acl=acl,
+        job_id="j-init2",
     )
     mgr.ingest(req)
 
@@ -306,12 +372,18 @@ def test_same_tenant_readable_but_not_owner_is_refused() -> None:
         mgr.purge(reader, corpus_id="eng", document_id="doc2")
     with pytest.raises(DocumentMutationError):
         mgr.update(
-            reader, corpus_id="eng", document_id="doc2",
-            content="x", job_id="jx", document_version="v2",
+            reader,
+            corpus_id="eng",
+            document_id="doc2",
+            content="x",
+            job_id="jx",
+            document_version="v2",
         )
     with pytest.raises(DocumentMutationError):
         mgr.tighten_acl(
-            reader, corpus_id="eng", document_id="doc2",
+            reader,
+            corpus_id="eng",
+            document_id="doc2",
             acl=ResourceAcl(tenant_id="t1", security_level="public", acl_scope="tenant"),
         )
 

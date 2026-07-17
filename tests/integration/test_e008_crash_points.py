@@ -364,7 +364,9 @@ def test_taken_over_build_cannot_corrupt_active_version() -> None:
 
     # j2 completes (explicit recovery of its own crashed attempt on the
     # still-RUNNING lease); the active version is correct and uncorrupted.
-    res2 = manager.ingest(_request(job_id="j2", version="v1", content=SAMPLE_MARKDOWN), recover=True)
+    res2 = manager.ingest(
+        _request(job_id="j2", version="v1", content=SAMPLE_MARKDOWN), recover=True
+    )
     assert res2.status == IngestionStatus.INDEXED
     assert store.get_build_owner("t1", "eng", "doc1", "v1") == "j2"
     assert _retrieve_versions(retriever) == ["v1"]
@@ -389,9 +391,7 @@ def test_deprecated_version_redelivery_is_idempotent() -> None:
     points_before = vector._client.count("eng").count
 
     # Re-deliver v1 with a NEW job_id and identical content.
-    res = manager.ingest(
-        _request(job_id="j3", version="v1", content=SAMPLE_MARKDOWN)
-    )
+    res = manager.ingest(_request(job_id="j3", version="v1", content=SAMPLE_MARKDOWN))
     assert res.status == IngestionStatus.ALREADY_INDEXED
 
     # v1's data plane is untouched (still deprecated, never deleted/written).
@@ -561,8 +561,7 @@ def test_upgrade_008_backfill_then_takeover_cleans_old_data_plane() -> None:
     assert store.get_job_previous_version("jA") == "v0"
     # ...but the lease column was never backfilled (pre-008 state): NULL.
     store._conn.execute(  # noqa: SLF001
-        "UPDATE document_builds SET previous_active_version = NULL "
-        "WHERE owner_job_id='jA'"
+        "UPDATE document_builds SET previous_active_version = NULL WHERE owner_job_id='jA'"
     )
     store._conn.commit()
 
@@ -576,7 +575,9 @@ def test_upgrade_008_backfill_then_takeover_cleans_old_data_plane() -> None:
 
     # A DIFFERENT job_id takes over the same version and publishes; the TRUE
     # replaced version (v0) must be cleaned from the data plane.
-    res = manager.ingest(_request(job_id="jB", version="v1", content=SAMPLE_MARKDOWN + "\n\n## v1\n"))
+    res = manager.ingest(
+        _request(job_id="jB", version="v1", content=SAMPLE_MARKDOWN + "\n\n## v1\n")
+    )
     assert res.status == IngestionStatus.INDEXED
     assert store.get_job_status("jB") == JobStatus.SUCCEEDED
     assert store.get_active_document("t1", "eng", "doc1").version == "v1"

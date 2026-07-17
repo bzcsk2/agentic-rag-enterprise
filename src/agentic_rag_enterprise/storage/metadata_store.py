@@ -149,9 +149,7 @@ class MetadataStore:
             # ";" into individual statements (our migration files keep ";" only
             # as a statement separator, never inside string literals).
             sql_lines = [
-                ln
-                for ln in script.splitlines()
-                if ln.strip() and not ln.strip().startswith("--")
+                ln for ln in script.splitlines() if ln.strip() and not ln.strip().startswith("--")
             ]
             statements = [
                 s.strip() for s in ("\n".join(sql_lines) + "\n" + marker).split(";") if s.strip()
@@ -324,11 +322,7 @@ class MetadataStore:
                     # coercing through JobStatus (which has no 'done' member).
                     lease_is_running = lease["status"] == "running"
                     lease_attempt = lease["attempt_id"]
-                    if (
-                        lease_is_running
-                        and lease_attempt != attempt_id
-                        and not recover
-                    ):
+                    if lease_is_running and lease_attempt != attempt_id and not recover:
                         raise BuildConflict(
                             f"job {job_id!r} already has a live execution attempt "
                             f"(attempt_id={lease_attempt!r}); refusing duplicate "
@@ -470,13 +464,9 @@ class MetadataStore:
         if existing is None:
             names = ", ".join(cols)
             placeholders = ", ".join(f":{c}" for c in cols)
-            cur.execute(
-                f"INSERT INTO documents ({names}) VALUES ({placeholders})", cols
-            )
+            cur.execute(f"INSERT INTO documents ({names}) VALUES ({placeholders})", cols)
         elif existing["status"] in ("processing", "failed"):
-            assigns = ", ".join(
-                f"{c} = :{c}" for c in cols if c != "lifecycle_revision"
-            )
+            assigns = ", ".join(f"{c} = :{c}" for c in cols if c != "lifecycle_revision")
             cur.execute(
                 f"UPDATE documents SET {assigns} "
                 "WHERE tenant_id=:tenant_id AND corpus_id=:corpus_id "
@@ -1003,9 +993,7 @@ class MetadataStore:
         ).fetchone()
         return self._row_to_document(row) if row else None
 
-    def list_document_versions(
-        self, tenant_id: str, corpus_id: str, document_id: str
-    ) -> list[str]:
+    def list_document_versions(self, tenant_id: str, corpus_id: str, document_id: str) -> list[str]:
         """All version rows for a document (active, deprecated, failed, deleted)."""
         rows = self._conn.execute(
             "SELECT version FROM documents WHERE tenant_id=? AND corpus_id=? AND document_id=?",

@@ -14,8 +14,10 @@ from agentic_rag_enterprise.answer.citations import (
 )
 from agentic_rag_enterprise.answer.envelope import (
     AnswerEnvelope,
+    AnswerEnvelopeError,
     Citation,
     Claim,
+    TenantBindingError,
 )
 from agentic_rag_enterprise.answer.verification import (
     ClaimVerificationResult,
@@ -26,6 +28,8 @@ __all__ = [
     "AnswerEnvelope",
     "Claim",
     "Citation",
+    "AnswerEnvelopeError",
+    "TenantBindingError",
     "render_citations",
     "format_citation_panel",
     "verify_claims",

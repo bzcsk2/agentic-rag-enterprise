@@ -27,9 +27,18 @@ def verify_claims(
 ) -> ClaimVerificationResult:
     """Validate that claims bind only to Evidence that was actually used.
 
+    A claim is treated as unsupported (and removed from the final answer) when
+    any of the following hold, so that an ``unsupported`` claim can never enter
+    the final answer (build plan §16.4):
+
+    * its ``support_status`` is already ``unsupported``;
+    * it carries no ``evidence_ids`` (nothing grounds it);
+    * one or more of its ``evidence_ids`` do not resolve to the Evidence
+      actually used by the answer.
+
     Args:
         claims: The extracted claims (their ``support_status`` is taken as given
-            by the upstream extractor unless evidence fails to resolve).
+            by the upstream extractor unless it fails the checks above).
         evidence_ids: The set of Evidence snapshot ids available to the answer.
 
     Returns:
@@ -42,10 +51,10 @@ def verify_claims(
 
     for claim in claims:
         unresolved = [eid for eid in claim.evidence_ids if eid not in evidence_ids]
-        if unresolved:
-            claim = claim.model_copy(update={"support_status": "unsupported"})
-            removed.append(claim)
-            if claim.importance == "critical":
+        if claim.support_status == "unsupported" or not claim.evidence_ids or unresolved:
+            updated = claim.model_copy(update={"support_status": "unsupported"})
+            removed.append(updated)
+            if updated.importance == "critical":
                 any_critical_unsupported = True
             continue
         kept.append(claim)
