@@ -10,17 +10,26 @@
   reauthorization after ACL tightening/delete, per-owner ACL persistence, fuzzy-dedup
   replacement, and executable acceptance commands). Full contract at
   `docs/issue-e011-contract.md`.
-- Issue: **E-012** — Single-corpus Fast Path and one-pass sufficiency decision —
-  implemented in the current change set (additive; no E-011 behaviour changed). Adds
-  `retrieval/fast_path.py`: `run_fast_path` calls `SecureRetriever.retrieve_evidence`
-  exactly once and applies the deterministic baseline sufficiency rule (≥1 Evidence →
-  `sufficient`; 0 → `insufficient`, downstream must abstain). Typed `FastPathResult`
-  (`sufficiency` + `stop_reason` + derived `is_sufficient`/`should_abstain`) and a typed
-  `FastPathBackendError` so a retrieval fault is never relabelled as "no answer". Full
-  contract at `docs/issue-e012-contract.md`.
-- Next issue: **E-013** — AnswerEnvelope, citation rendering, single key-claim support
-  verification, and conservative refusal. Reuses the E-012 Fast Path result; must NOT
-  start until E-012 is accepted.
+- Issue: **E-012** — Single-corpus Fast Path and one-pass sufficiency decision — CLOSED
+  (local commit `fbb24f8`; acceptance verdict **PASS**). Adds `retrieval/fast_path.py`:
+  `run_fast_path` calls `SecureRetriever.retrieve_evidence` exactly once and applies the
+  deterministic baseline sufficiency rule (≥1 Evidence → `sufficient`; 0 → `insufficient`,
+  downstream must abstain). Frozen, validated `FastPathResult` (`sufficiency` + `stop_reason`
+  + derived `is_sufficient`/`should_abstain`) and a typed `FastPathBackendError` so a
+  retrieval fault is never relabelled as "no answer". Full contract at
+  `docs/issue-e012-contract.md`.
+- Issue: **E-013** — AnswerEnvelope, citation rendering, single key-claim support
+  verification, and conservative refusal — implemented in the current change set
+  (additive; no E-011/E-012 behaviour changed). Adds `answer/`: `AnswerEnvelope` (frozen,
+  validated — no dangling citation, `abstained` state locked), `Claim`/`Citation` models,
+  `render_citations`/`format_citation_panel` (immutable snapshot refs), `verify_claims`
+  (deterministic single-pass: unsupported claims removed, critical removal downgrades
+  `completeness` to `partial`), and `build_answer_envelope`/`conservative_refusal` driven by
+  the E-012 `FastPathResult` (insufficient ⇒ abstained refusal with no fabricated facts).
+  Full contract at `docs/issue-e013-contract.md`.
+- Next issue: **E-014** — shared chat application service, synchronous `/v1/chat` contract,
+  and a minimal Gradio adapter. Wires the LLM that produces `answer_markdown` + `claims`
+  consumed by E-013; must NOT start until E-013 is accepted.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
