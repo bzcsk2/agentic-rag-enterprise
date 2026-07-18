@@ -81,8 +81,12 @@
   - **M3 / E-019 → E-020** — Evaluation & grounding-judge MVP — **implemented**; committed and pushed
     (latest acceptance remediation `325dad0` → follow-up remediation). `no_new_evidence` is reachable
     end-to-end via one-new-gap-query-per-round; `gap_rounds`/`iterations` equal executed rounds.
-  - **M4 / E-015 → E-016** — Research MVP (multi-Corpus Registry, Planner DAG, Required-Fact
-    Judge, iteration). Not started.
+  - **M4 / E-015 → E-016** — Multi-Corpus retrieval (build plan §9 / Milestone 4). **E-015
+    (Corpus/Capability Registry + three Corpus fixtures + permission-safe discoverability)
+    implemented** (current change set). **E-016** (permission-aware soft router + cross-Corpus
+    retrieval merge + dedup) not started. Explicitly **excludes** Planner DAG, Required-Fact
+    Judge and iteration (those are M5 / E-017 → E-018 and M3 / E-019 → E-020 respectively);
+    the build-plan M4 description that listed them is corrected to match §9 / Milestone 4.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
