@@ -53,11 +53,14 @@ def false_sufficient(
        attached and regardless of what the system's own coverage says. This is
        the principal rule and must fire even for envelopes that carry no
        ``coverage`` (e.g. the M2 baseline), because gold is the source of truth.
-    2. **Independent coverage cross-check.** When a ``coverage`` IS attached, gold
-       fact references are resolved to their canonical ids (``make_required_fact``)
-       and intersected with the coverage's own ``missing`` / ``contradicted`` sets,
-       so a description-based gold label lines up with the ``fact_<sha>`` ids the
-       runner/coverage use. This is a separate guard that can fire on its own.
+    2. **Independent coverage cross-check.** When a ``coverage`` IS attached, the
+       envelope is flagged directly if that coverage reports any ``missing`` /
+       ``contradicted`` facts of its own (i.e. the answer is ``complete`` while the
+       Coverage Judge's own verdict disagrees). This branch is reached only for
+       ``complete`` answers with an *empty* ``gold_missing_fact_ids`` (the primary
+       guard already handled the gold-missing case above), so it must NOT intersect
+       with the gold set — doing so would reduce this branch to dead code. It is a
+       separate, self-consistency guard that can fire on its own.
 
     A non-``complete`` answer (partial / insufficient / conflicted) is never a
     False Sufficient, so it scores 1.0.

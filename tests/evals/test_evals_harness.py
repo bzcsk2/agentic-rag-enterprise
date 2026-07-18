@@ -76,6 +76,36 @@ def test_false_sufficient_clean_when_gold_empty_and_complete() -> None:
     assert res.score == 1.0
 
 
+def test_false_sufficient_secondary_guard_fires_on_coverage_self_contradiction() -> None:
+    # Regression for P2-1: a `complete` envelope whose OWN coverage reports
+    # missing/contradicted facts must be flagged by the secondary guard even when
+    # gold is empty (the primary gold guard does not apply). The guard fires on
+    # the coverage's uncovered facts directly, NOT on an (empty) gold intersection.
+    cov = SufficiencyResult(
+        overall_status="sufficient",
+        fact_coverage=(FactCoverage(fact_id="f1", status=FactStatus.SUPPORTED, required=True),),
+        missing_fact_ids=("f1",),
+    )
+    env = _make_env(completeness="complete", coverage=cov)
+    res = false_sufficient(env, gold_missing_fact_ids=[])
+    assert res.score == 0.0
+    assert res.details["fired"] is True
+    assert res.details["via"] == "coverage_cross_check"
+
+
+def test_false_sufficient_secondary_guard_clean_when_coverage_fully_supported() -> None:
+    # Mirror of the above: a `complete` envelope with empty gold AND a coverage
+    # that reports no missing/contradicted facts must score 1.0 (the secondary
+    # guard does not fire on a self-consistent sufficient coverage).
+    cov = SufficiencyResult(
+        overall_status="sufficient",
+        fact_coverage=(FactCoverage(fact_id="f1", status=FactStatus.SUPPORTED, required=True),),
+    )
+    env = _make_env(completeness="complete", coverage=cov)
+    res = false_sufficient(env, gold_missing_fact_ids=[])
+    assert res.score == 1.0
+
+
 def test_false_sufficient_clean_when_not_complete() -> None:
     cov = SufficiencyResult(
         overall_status="partially_sufficient",
@@ -133,7 +163,13 @@ def test_report_generated_and_gate_passes() -> None:
     # M2 baseline, emit the machine-readable report, and confirm the provisional
     # False-Sufficient gate is green (P1-5). The judge-timeout degradation block
     # must also be exercised with a real JudgeTimeoutError (P1-D).
+    from agentic_rag_enterprise.evals.dataset import load_dataset
     from agentic_rag_enterprise.evals.report import _REPORT_PATH, generate_m3_report
+
+    dataset = load_dataset("m3_v1")
+    # A case whose round-0 query returns no evidence abstains before the judge is
+    # ever invoked, so it cannot prove the judge-timeout degradation path.
+    n_first_round_has_evidence = sum(1 for c in dataset.cases if c.evidence.get(c.query))
 
     report = generate_m3_report(write=True)
     assert report["summary"]["provisional_gate_pass"] is True
@@ -143,9 +179,12 @@ def test_report_generated_and_gate_passes() -> None:
         if case["m3"]["completeness"] == "complete":
             assert case["m3"]["false_sufficient"] == 1.0
     # Every timeout scenario must degrade conservatively (abstain, not a
-    # fabricated complete answer) — proving P1-D end-to-end.
-    assert report["summary"]["n_timeout_cases"] >= 1
+    # fabricated complete answer) — proving P1-D end-to-end. Regression for P2-2:
+    # only cases where the faulting judge was actually invoked are counted, so a
+    # first-round-insufficient case (judge never called) is excluded.
+    assert report["summary"]["n_timeout_cases"] == n_first_round_has_evidence
     assert report["summary"]["judge_timeout_degradation_failures"] == 0
     for tcase in report["timeout_cases"]:
+        assert tcase["judge_fault_injected"] is True
         assert tcase["abstained"] is True
         assert tcase["judge_timeout_degradation"] == 1.0
