@@ -14,21 +14,27 @@
   the unauthorized Corpus name cannot leak via `str()`/`repr()` into logs. Full contract
   at `docs/issue-e017-contract.md`.
 - Issue: **E-018** — Controlled Executor + dependent multi-hop — **contract amended
-  (P1-1..P1-5 + P2 from the `5d02d99` re-audit) / implementation still pending** (acceptance
+  (P1-1..P1-5 + P2 + 6-item re-audit fix) / implementation still pending** (acceptance
   of the amended `docs/issue-e018-contract.md` unlocks implementation). Consumes an accepted
   `QueryPlan`: `StepResult` (frozen state machine:
   pending/running/succeeded/failed/timed_out/skipped_dependency/budget_exhausted),
   parallel-ready scheduling in topological layers, required/optional dependency + binding
   semantics, per-step timeout, **atomic** shared Tool-Call budget (`AtomicToolBudget` with a
-  single `try_reserve` API, no double-count), exactly one retry (initial + 1, retryable types
+  single `try_reserve` API, no double-count; `PlanStep.max_tool_calls` is runtime cap;
+  multi-corpus step reserves N units per attempt), exactly one retry (initial + 1, retryable types
   only: `RetrievalBackendError`/`ConnectionError`/`TimeoutError` + registered transient
-  infra), fail-closed security degradation, and a final `PlanExecutionResult`. The amendment
-  also froze: `facts.<id>.value` == `RequiredFact.description`; a `ToolSpec` (input/output
-  model + retryable errors) that decides optional-binding missingness; the distinction
+  infra; retry blocked when `max_tool_calls=1`), fail-closed security degradation, and a final
+  `PlanExecutionResult` with deterministic `evidence_ids` first-occurrence dedup and **no**
+  whole-execution `error_code`/`message` (fail-closed → `PlanExecutionError`). The amendment
+  also froze: `facts.<id>.value` == `RequiredFact.description`; a `ToolSpec` (`ToolRegistry.get()`
+  returns `(Tool, ToolSpec)`; `ToolSpec.input_model` uses `is_required()` for missingness; `ToolSpec.output_models`
+  maps all four `OutputSchemaId` values to their output model) that decides optional-binding
+  missingness; the distinction
   between local data `binding_error` (step-only failure) and security binding failure
   (whole-execution fail-closed); the full `PlanExecutionResult` schema + "usable result"
   (Evidence-based) definition; and the deterministic `RetrieverTool` Evidence→`entity`/`spec`
-  projection (no LLM). Full contract at `docs/issue-e018-contract.md`.
+  projection (no LLM; `retrieval_score=None`→`0.0`, sort: score desc, authority desc, evidence_id asc;
+  empty list returns empty outputs). Full contract at `docs/issue-e018-contract.md`.
 - Prior milestone **M4 / E-015 -> E-016** — Multi-Corpus retrieval — **CLOSED / ACCEPTED**
   at `033c8e2` (E-016 second re-audit passed). E-015 (Corpus/Capability Registry
   + three Corpus fixtures + permission-safe discoverability) CLOSED; E-016
@@ -644,7 +650,7 @@ execution, no `SecureRetriever` call, no Tool.** Full contract at
   is injected); no temporal-conflict arbitration; no `agents/`/`graph/` runtime change; no
   change to E-011→E-016 behaviour.
 
-## E-018 Allowed Changes (M5 only) — contract amended (P1-1..P1-5 + P2) / implementation pending
+## E-018 Allowed Changes (M5 only) — contract amended (P1-1..P1-5 + P2 + 6-item re-audit fix) / implementation pending
 Controlled Executor + dependent multi-hop (build plan §13.4). Full contract at
 `docs/issue-e018-contract.md`.
 - `src/agentic_rag_enterprise/planner/` (extend): `executor.py` (`PlanExecutor.execute(
@@ -654,22 +660,30 @@ Controlled Executor + dependent multi-hop (build plan §13.4). Full contract at
   `StepStatus` = pending/running/succeeded/failed/timed_out/skipped_dependency/
   budget_exhausted; `StepResult.detail` `Field(exclude=True, repr=False)`;
   `PlanExecutionResult` carries `degraded`, `limitations`, `tool_calls_used` (= budget used),
-  `evidence_ids`, `detail` `exclude=True, repr=False`; "usable result" = ≥1 succeeded step
-  with Evidence, else raise `PlanExecutionError`),
+  `evidence_ids` (first-occurrence deterministic dedup), `detail` `exclude=True, repr=False`;
+  **no** whole-execution `error_code`/`message` (fail-closed → `PlanExecutionError`);
+  "usable result" = ≥1 succeeded step with Evidence, else raise `PlanExecutionError`),
   `budget.py` (`AtomicToolBudget` — single `try_reserve(n)` API doing `remaining -= n;
-  used += n` atomically; no separate `reserve`+`consume`; no refund),
-  `tool_registry.py` (`ToolRegistry` (+ `ToolSpec` with `input_model`/`output_model`/
+  used += n` atomically; no separate `reserve`+`consume`; no refund;
+  `PlanStep.max_tool_calls` is runtime cap; multi-corpus step reserves N units per attempt),
+  `tool_registry.py` (`ToolRegistry.get()` returns `(Tool, ToolSpec)` with ToolSpec having
+  `input_model` (field requiredness via `is_required()` for missingness decision) +
+  `output_models: Mapping[OutputSchemaId, type[BaseModel]]` covering all four schema IDs +
   `retryable_errors`) + `Tool` protocol; `RetrieverTool` wrapping `SecureRetriever.
   retrieve_evidence` and deterministically projecting `list[SnapshotEvidence]` →
-  `entity_text`/`spec_text` per `output_schema_id` (no LLM); lookup by `step_type +
-  capability_id`),
+  `entity_text`/`spec_text` per `output_schema_id` (no LLM; sort: `retrieval_score` desc
+  (None→0.0), `authority_level` desc, `evidence_id` asc; empty list → empty outputs);
+  lookup by `step_type + capability_id`),
   `errors.py` (`PlanExecutionError`).
 - `tests/unit/planner/test_executor.py`, `tests/unit/planner/test_atomic_budget.py`,
   `tests/integration/test_e018_executor_pipeline.py` — cover the §11 acceptance matrix
   (parallel, diamond-once, binding, required-skip, optional-continue, timeout-no-overwrite,
   retry-once-consumes-2, no-retry-on-programming-error, budget=1 single-flight,
   retry+parallel no-overspend, unauthorized fail-closed, security-no-degrade, illegal-zero-
-  tool, deterministic order, tool_calls_used matches, no corpus/tenant leak, no dynamic step).
+  tool, deterministic order, tool_calls_used matches, no corpus/tenant leak, no dynamic step;
+  plus the 6-item re-audit: max_tool_calls runtime cap, multi-corpus budget, ToolRegistry
+  return type + output_models mapping, is_required() missingness, projection edge cases,
+  PlanExecutionResult error removal + evidence_ids first-occurrence dedup).
 - `docs/issue-e018-contract.md`, `AGENTS.md`.
 - **Reuse, no change:** `planner/models.py` (`QueryPlan`/`PlanStep`/`StepDependency`),
   `planner/binding.py` (grammar parse), `planner/validator.py` (`PlanValidator`),

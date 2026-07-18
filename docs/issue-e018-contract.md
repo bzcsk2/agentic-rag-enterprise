@@ -1,7 +1,7 @@
 # Issue E-018 — Controlled DAG Executor + dependent multi-hop
 
 **Milestone:** M5 — Controlled Planner and dependent multi-hop (`E-017 -> E-018`)
-**Status:** contract amended (P1-1..P1-5 + P2 from the `5d02d99` re-audit) / implementation still pending — acceptance of this amended doc unlocks `executor.py`, result models, budget, tool registry, and tests
+**Status:** contract amended (P1-1..P1-5 + P2 from the `5d02d99` re-audit; 6-item re-audit fix at `2027102` resubmission) / implementation still pending — acceptance of this amended doc unlocks `executor.py`, result models, budget, tool registry, and tests
 **Baseline:** `0e81ac0` (M5 / E-017 CLOSED / ACCEPTED)
 **Build plan refs:** §13.2 (Planner DAG), §13.4 (DAG execution), §13.5 (Planner 不得决定权限), §9.1 / §9.2 (Capability + Corpus Registry), §12.x (retrieval security envelope).
 **Depends on:** E-017 `QueryPlan` / `PlanStep` / `StepDependency` / `BindingExpression` / `PlanValidator` (frozen, ACCEPTED at `398f059`/`0e81ac0`).
@@ -100,10 +100,9 @@ class PlanExecutionResult(BaseModel):
     degraded: bool                      # partial success -> True (see usable-result rule)
     steps: tuple[StepResult, ...]       # in deterministic plan / topological order
     tool_calls_used: int                # == sum of StepResult.tool_calls_consumed
-    evidence_ids: tuple[str, ...]       # union of all succeeded steps' evidence_ids
+    evidence_ids: tuple[str, ...]       # deduplicated union in first-occurrence topological order
+
     limitations: tuple[str, ...] = ()   # human-readable degradation notes (user-safe)
-    error_code: str | None = None       # set when the whole execution fails closed
-    message: str = ""                   # USER-SAFE (never corpus/tenant/user names)
     detail: str = Field(default="", exclude=True, repr=False)  # internal only
 ```
 
@@ -112,9 +111,20 @@ Invariants:
 - `tool_calls_used` == `sum(s.tool_calls_consumed for s in steps)` (single source of truth =
   the `AtomicToolBudget` used count).
 - `steps` ordering is deterministic (§5): original plan step order with topological tie-break.
-- `evidence_ids` = the union of `evidence_ids` across `succeeded` steps only.
+- `evidence_ids` = the union of `evidence_ids` across `succeeded` steps only, with
+  **first-occurrence determinism**: iterate steps in topological order; within each step
+  iterate its `evidence_ids` in the Tool's returned order. The first time a given
+  `evidence_id` string is seen, it is appended to the output tuple. Duplicates from later
+  steps (or within the same step) are silently dropped. This guarantees a deterministic,
+  context-independent dedup order regardless of execution parallelism.
 - `limitations` entries are **user-safe** (no corpus/tenant name); internal specifics live in
   `detail`.
+- `PlanExecutionResult` is **only** produced for usable results (≥1 step with Evidence) or
+  zero-Evidence-but-degraded cases. Pure-fail closed results (all steps failed, security
+  binding failure) are communicated exclusively via `PlanExecutionError` — there is no
+  `PlanExecutionResult` returned for those cases. Consequently, the model carries **no**
+  whole-execution `error_code` or `message` fields (they would be redundant with the
+  exception).
 
 **"Usable result" definition (frozen):**
 
@@ -205,6 +215,7 @@ needs per-field input typing. This is supplied by a `ToolSpec` returned alongsid
 the E-017 `QueryPlan`, so it requires no E-017 model change:
 
 ```python
+from collections.abc import Mapping
 from pydantic import BaseModel
 
 class ToolSpec(BaseModel):
@@ -212,8 +223,10 @@ class ToolSpec(BaseModel):
     step_type: str
     capability_id: str
     input_model: type[BaseModel]        # validates resolved_inputs; fields carry
-                                         # Optional[...] / required to decide missingness
-    output_model: type[BaseModel]       # validates TypedStepOutput against output_schema_id
+                                         # default / no-default to decide missingness
+    output_models: Mapping[OutputSchemaId, type[BaseModel]]
+                                         # one output model per schema_id
+                                         # (entity / spec / comparison / intermediate)
     retryable_errors: frozenset[type[Exception]]  # e.g. {RetrievalBackendError,
                                                   #        ConnectionError, TimeoutError}
 ```
@@ -222,15 +235,21 @@ class ToolSpec(BaseModel):
   `ToolRegistration` carrying both).
 - **Optional-binding missingness rule (frozen):** before launch the Executor builds
   `resolved_inputs` from completed-upstream outputs + `facts.<id>.value`. It then validates
-  `resolved_inputs` against `ToolSpec.input_model`. A field declared `Optional[...]` (or
-  explicitly nullable) **tolerates absence** → the step runs with that field `None` /
-  omitted. A **required** input field that is missing (because a required upstream did not
-  succeed, or a required `input_binding` resolved to nothing) → the step **does not execute**
+  `resolved_inputs` against `ToolSpec.input_model`. A field whose `is_required()` returns
+  `False` (i.e., Pydantic `model_fields[name].is_required() == False`, meaning the field
+  has a default) **tolerates absence** → the step runs with that field set to its default /
+  `None`. A **required** input field that is missing → the step **does not execute**
   and is `skipped_dependency` / `failed` per §3/§4. The Tool never guesses; the decision is
-  driven entirely by `ToolSpec.input_model`.
-- `output_model` is the code-side schema registered under `output_schema_id`
-  (`entity` / `spec` / `comparison` / `intermediate`); a mismatch → non-retryable
-  `failed` (`error_code="output_schema_error"`).
+  driven entirely by `ToolSpec.input_model` field requiredness.
+  **After this validation the `resolved_inputs` dict is frozen** — no further mutation,
+  no late-binding, no "field appeared after launch". The missing/absent state is a single
+  terminal decision: once a field is determined to be absent (defaulted), that absence is
+  immutable for the lifetime of the step.
+- `output_models` is a mapping from `OutputSchemaId` to the code-side output model for
+  that schema. The Executor selects `output_models[PlanStep.output_schema_id]` to validate
+  step output **before** it becomes a `StepResult` (§4). A mismatch → non-retryable
+  `failed` (`error_code="output_schema_error"`). If `output_schema_id` is not present in
+  the mapping (programming error), the Executor fails closed.
 
 This removes the earlier undefined "field-level schema" reference: the deciding schema is
 now the explicit `ToolSpec.input_model`.
@@ -283,6 +302,35 @@ Frozen rules (the §6 race surface) — **single, unambiguous API:**
 - **No refunds** — a retry spends a fresh unit; refunding would enable double-spend under
   concurrency.
 - Steps MUST NOT keep their own counters; all accounting goes through `AtomicToolBudget`.
+- **`PlanStep.max_tool_calls` is a runtime cap** on the total budget units the step may
+  consume across all its attempts (initial + retries). For a single-corpus step each attempt
+  calls `try_reserve(1)`; for a multi-corpus step each attempt calls `try_reserve(N)` where
+  N = `len(target_corpus_ids)` (§6a). If the cumulative reserve would exceed
+  `PlanStep.max_tool_calls` the attempt MUST NOT launch — the step is `budget_exhausted`.
+  Consequence: `max_tool_calls=1` with a single-corpus step permits **exactly one attempt**
+  (no retry); a multi-corpus step with N corpora requires `max_tool_calls >= N` for any
+  attempt at all.
+
+## 6a. Multi-corpus budget accounting
+
+When a step targets N corpora (`len(PlanStep.target_corpus_ids) == N`), the
+`RetrieverTool` must perform one retrieval call per corpus. The budget therefore
+accounts per-corpus, not per-step-attempt:
+
+- Each attempt for a multi-corpus step calls `try_reserve(N)` (not `try_reserve(1)`)
+  before any retrieval begins — a single atomic reservation covering all N corpus
+  calls in that attempt.
+- `PlanStep.max_tool_calls` must be ≥ N for the first attempt to launch. A retry
+  reserves another N units, so `max_tool_calls ≥ 2N` for both attempt 1 and a retry
+  to be possible.
+- A step with `max_tool_calls < len(target_corpus_ids)` is **inherently unexecutable**.
+  The Executor's pre-execution re-validation (§5: "illegal plan rejected before the
+  Executor starts") must reject it before scheduling: a step whose `max_tool_calls`
+  is less than its corpus count is treated as a budget violation (zero Tools launched
+  for that step or for the whole plan if all steps are blocked).
+- `tool_calls_used` (`PlanExecutionResult`) and `AtomicToolBudget.used()` reflect the
+  true number of per-corpus retrieval calls launched, not step-level attempts.
+  `StepResult.tool_calls_consumed` = `N × attempts` for a multi-corpus step.
 
 ## 7. Timeout & cancellation
 
@@ -330,7 +378,11 @@ infrastructure faults are retryable:
 
 Retry mechanics:
 
-- A retry **reserves a fresh Tool-Call budget unit** (§6) before launching.
+- A retry **reserves a fresh Tool-Call budget unit(s)** (§6/§6a) before launching.
+  A retry is only permitted when `PlanStep.max_tool_calls` provides sufficient remaining
+  budget for the retry's reserve amount (see §6 runtime cap). When `max_tool_calls == 1`
+  (single-corpus step), all non-terminal errors — including retryable types — result in
+  terminal `failed` with no retry attempt.
 - `StepResult.attempts` reflects the true attempt count (1 or 2).
 - A non-retryable error on attempt 1 → terminal `failed`, no second attempt.
 - Programming errors (`ValueError`/`TypeError`/`KeyError`) propagate as their real type and
@@ -377,7 +429,7 @@ class Tool(Protocol):
     ) -> TypedStepOutput: ...
 
 class ToolRegistry(Protocol):
-    def get(self, step_type: str, capability_id: str) -> Tool: ...
+    def get(self, step_type: str, capability_id: str) -> tuple[Tool, ToolSpec]: ...
 ```
 
 Rules:
@@ -419,8 +471,30 @@ into the synthesis model). This is what makes the dependent two-hop real end-to-
 Step 1 (`output_schema_id="entity"`) yields `entity_text`; the binding
 `steps.step1.outputs.entity_text` is substituted into Step 2's `query_template`; Step 2
 retrieves against the bound value. No Fake Tool is required for the main path. The soft
-binding field name (`entity_text` / `spec_text`) is part of the frozen `ToolSpec.output_model`
-so the grammar's `output_field` (`steps.<id>.outputs.<field>`) resolves against a real key.
+binding field name (`entity_text` / `spec_text`) is part of the frozen
+`ToolSpec.output_models[step.output_schema_id]` so the grammar's `output_field`
+(`steps.<id>.outputs.<field>`) resolves against a real key.
+
+### Frozen edge-case rules for the deterministic projection
+
+- **`retrieval_score=None`**: treated as `0.0` for sorting purposes. If every Evidence in
+  the list has `retrieval_score=None`, all are treated as equal for the score comparison
+  and the tie-break order (see below) decides the top selection.
+- **Sort direction (full sort order)**: Evidence is sorted by
+  `retrieval_score` descending (higher → better), then `authority_level` descending,
+  then `evidence_id` ascending (lexicographic). This applies to the top-N selection for
+  `entity`/`spec` and to the iteration order for `comparison`/`intermediate`.
+- **Empty Evidence list**: `retrieve_evidence` returns `[]`. The projection returns:
+  - `entity` → `{"entity_text": "", "corpus_id": "", "document_id": "",
+    "section_path": (), "authority_level": 0}`
+  - `spec` → `{"spec_text": "", "corpus_id": "", "document_id": "",
+    "metadata": {"authority_level": 0, "retrieval_score": None, "section_path": []}}`
+  - `comparison` → `{"items": [], "evidence_ids": []}`
+  - `intermediate` → `{"texts": [], "evidence_ids": []}`
+  In all cases `evidence_ids` in the returned `TypedStepOutput` is `()` (empty tuple).
+  The step reports `succeeded` but provides no usable Evidence. The §2a usable-result
+  rule applies: if every step produces zero `evidence_ids`, the whole execution raises
+  `PlanExecutionError`.
 
 ## 11. Acceptance matrix (execution test plan)
 
@@ -460,6 +534,19 @@ so the grammar's `output_field` (`steps.<id>.outputs.<field>`) resolves against 
 23. `RetrieverTool` projects `list[SnapshotEvidence]` into `entity_text` / `spec_text` via the
     frozen deterministic rule (no LLM), so Step-1 output binds into Step-2 `query_template`
     on the real main path (no Fake Tool).
+24. A step with `max_tool_calls=1` that hits a retryable fault does **not** retry (terminal
+    `failed` with `attempts=1`).
+25. A multi-corpus step targeting N corpora reserves N budget units per attempt
+    (`try_reserve(N)`); `PlanStep.max_tool_calls < len(target_corpus_ids)` prevents any
+    launch.
+26. `PlanExecutionResult.evidence_ids` dedup follows first-occurrence order (topological step
+    order, then within-step Tool order); same-id from later steps is silently dropped.
+27. `RetrieverTool` projection sorts `retrieval_score` descending (None → `0.0`), then
+    `authority_level` descending, then `evidence_id` ascending; an empty Evidence list
+    returns schema-specific empty outputs and `evidence_ids=()`.
+28. `ToolRegistry.get()` returns `(Tool, ToolSpec)`; `ToolSpec.output_models` is a mapping
+    covering all four `OutputSchemaId` values; missing `output_schema_id` in the mapping
+    causes fail-closed.
 
 ## 12. Quality gates (implementation)
 
