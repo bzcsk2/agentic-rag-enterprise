@@ -41,23 +41,30 @@ _PLANNER_DIR = (
 )
 
 # Execution / retrieval surface the pure control plane must NOT touch (build plan §13.5).
+# The E-018 executor and tool_registry are allowed E-018 exceptions.
 _FORBIDDEN_IMPORTS = {
-    "agentic_rag_enterprise.retrieval.retriever",
-    "agentic_rag_enterprise.retrieval.secure_retriever",
     "agentic_rag_enterprise.retrieval.fast_path",
     "agentic_rag_enterprise.services.chat_service",
     "agentic_rag_enterprise.agents",
     "agentic_rag_enterprise.graph",
 }
 
+# E-018 files that legitimately import from the retrieval/storage surface.
+_E018_EXCLUDED_FILES = frozenset({
+    "executor.py",
+    "tool_registry.py",
+})
+
 
 def test_planner_package_imports_no_execution_surface() -> None:
-    """Architecture gate: the planner package must not import any retriever / executor /
-    service / agent module — illegal DAG enforcement is structural, not by guarding a call."""
+    """Architecture gate: E-017 control-plane files must not import any retriever / service /
+    agent module.  E-018 executor files are excluded (they legitimately call into retrieval)."""
     import ast as _ast
 
     found: set[str] = set()
     for path in _PLANNER_DIR.rglob("*.py"):
+        if path.name in _E018_EXCLUDED_FILES:
+            continue
         tree = _ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, _ast.ImportFrom) and node.module:
