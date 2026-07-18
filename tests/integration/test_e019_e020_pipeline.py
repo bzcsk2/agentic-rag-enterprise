@@ -27,6 +27,10 @@ def test_sufficient_case_end_to_end() -> None:
     assert env.coverage.overall_status == "sufficient"
     assert env.completeness == "complete"
     assert env.gap_rounds == 1
+    # P1-2: a non-abstain answer must carry at least one verified claim, and the
+    # answer text must be derived from the kept claims (Stage B enforced).
+    assert len(env.claims) >= 1
+    assert env.answer_markdown == "\n".join(c.text for c in env.claims)
 
 
 def test_gap_retrieval_reaches_sufficient_with_loop() -> None:
@@ -34,6 +38,8 @@ def test_gap_retrieval_reaches_sufficient_with_loop() -> None:
     assert env.coverage.overall_status == "sufficient"
     assert env.gap_rounds > 1
     assert len(env.evidence) == 2
+    assert len(env.claims) >= 1
+    assert env.answer_markdown == "\n".join(c.text for c in env.claims)
 
 
 def test_insufficient_case_abstains() -> None:
@@ -47,6 +53,9 @@ def test_contradicted_case_is_conflicted_not_abstained() -> None:
     assert env.coverage.overall_status == "contradicted"
     assert env.completeness == "conflicted"
     assert env.abstained is False
+    # The contradicted claim is surfaced (kept, not removed) so the user sees the
+    # conflict instead of a fabricated unique answer.
+    assert len(env.claims) >= 1
 
 
 def test_partial_exhausted_case() -> None:

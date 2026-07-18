@@ -3,14 +3,14 @@ judge-timeout degradation (build plan §14.5 scenario 17 + §14.6 spirit).
 """
 
 from agentic_rag_enterprise.answer.envelope import AnswerEnvelope
-from agentic_rag_enterprise.evals.dataset import load_dataset
+from agentic_rag_enterprise.evals.dataset import EvalCase, load_dataset
 from agentic_rag_enterprise.evals.metrics import (
     citation_coverage,
     false_sufficient,
     judge_timeout_degradation,
 )
+from agentic_rag_enterprise.evals.runner import run_case
 from agentic_rag_enterprise.judge.models import FactCoverage, FactStatus, SufficiencyResult
-from agentic_rag_enterprise.judge.query_fact_extractor import make_required_fact
 
 
 def _make_env(
@@ -39,20 +39,41 @@ def test_dataset_loads() -> None:
     assert len(ds.cases) >= 5
 
 
-def test_false_sufficient_fires_on_complete_with_missing_fact() -> None:
-    fid = make_required_fact("bonus structure").fact_id
-    cov = SufficiencyResult(
-        overall_status="sufficient",
-        fact_coverage=(
-            FactCoverage(fact_id=fid, status=FactStatus.MISSING, required=True),
-            FactCoverage(fact_id="f2", status=FactStatus.SUPPORTED, required=True),
-        ),
-        missing_fact_ids=(fid,),
+def test_false_sufficient_fires_on_real_judge_error() -> None:
+    # Real scenario (NOT a hand-built contradictory object): gold marks a fact as
+    # missing, the Coverage Judge marks it supported (the evidence does support
+    # it), and the envelope comes back `complete`. That is exactly the False
+    # Sufficient the gate must catch (P1-5).
+    case = EvalCase(
+        id="real-fs",
+        query="what is the bonus structure?",
+        corpus_id="eng",
+        required_facts=["bonus structure"],
+        evidence={"what is the bonus structure?": ["The bonus structure includes equity grants."]},
+        gold_missing_fact_ids=["bonus structure"],
     )
-    env = _make_env(completeness="complete", coverage=cov)
-    res = false_sufficient(env, gold_missing_fact_ids=[fid])
+    env = run_case(case)
+    assert env.completeness == "complete"
+    res = false_sufficient(env, case.gold_missing_fact_ids)
     assert res.score == 0.0
     assert res.details["fired"] is True
+
+
+def test_false_sufficient_clean_when_gold_empty_and_complete() -> None:
+    case = EvalCase(
+        id="clean-complete",
+        query="what is the vacation policy?",
+        corpus_id="eng",
+        required_facts=["vacation policy"],
+        evidence={
+            "what is the vacation policy?": ["The vacation policy grants 20 days paid leave."]
+        },
+        gold_missing_fact_ids=[],
+    )
+    env = run_case(case)
+    assert env.completeness == "complete"
+    res = false_sufficient(env, case.gold_missing_fact_ids)
+    assert res.score == 1.0
 
 
 def test_false_sufficient_clean_when_not_complete() -> None:
@@ -95,3 +116,18 @@ def test_citation_coverage_baseline() -> None:
     assert res.score == 1.0
     res2 = citation_coverage(["e1"], ["e1", "e2"])
     assert res2.score == 0.5
+
+
+def test_report_generated_and_gate_passes() -> None:
+    # The M3 exit gate: run the whole versioned dataset through the loop + the
+    # M2 baseline, emit the machine-readable report, and confirm the provisional
+    # False-Sufficient gate is green (P1-5).
+    from agentic_rag_enterprise.evals.report import _REPORT_PATH, generate_m3_report
+
+    report = generate_m3_report(write=True)
+    assert report["summary"]["provisional_gate_pass"] is True
+    assert _REPORT_PATH.exists()
+    # Defensive re-derivation: no `complete` M3 case may have slipped past the gate.
+    for case in report["cases"]:
+        if case["m3"]["completeness"] == "complete":
+            assert case["m3"]["false_sufficient"] == 1.0

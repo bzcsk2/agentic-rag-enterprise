@@ -65,6 +65,32 @@
       },
       "expected_overall": "contradicted",
       "gold_missing_fact_ids": []
+    },
+    {
+      "id": "case-non-latin",
+      "query": "员工休假政策是什么？",
+      "corpus_id": "eng",
+      "required_facts": ["员工休假政策"],
+      "evidence": {
+        "员工休假政策是什么？": [
+          "员工每年享有20天带薪年假。"
+        ]
+      },
+      "expected_overall": "ambiguous",
+      "gold_missing_fact_ids": []
+    },
+    {
+      "id": "case-stopword-only",
+      "query": "the and for",
+      "corpus_id": "eng",
+      "required_facts": ["the and for"],
+      "evidence": {
+        "the and for": [
+          "The bonus structure includes equity grants."
+        ]
+      },
+      "expected_overall": "ambiguous",
+      "gold_missing_fact_ids": []
     }
   ]
 }

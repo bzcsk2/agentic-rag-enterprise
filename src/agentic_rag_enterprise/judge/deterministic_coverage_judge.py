@@ -129,13 +129,18 @@ class DeterministicCoverageJudge:
     ) -> FactCoverage:
         fact_tokens = set(_tokenize(fact.description))
         if not fact_tokens:
-            # Degenerate fact (all stopwords) — treat as supported to avoid
-            # spuriously blocking the answer.
+            # Degenerate fact: the description carries no matchable token (e.g. a
+            # non-Latin string such as "员工休假政策", or a fact made entirely of
+            # stopwords). Per build plan §14.2 the judge must NOT invent support
+            # from a fact it cannot lexically evaluate — fail closed to AMBIGUOUS
+            # (does not claim sufficiency, does not spuriously retry) rather than
+            # falsely marking the fact SUPPORTED.
             return FactCoverage(
                 fact_id=fact.fact_id,
-                status=FactStatus.SUPPORTED,
+                status=FactStatus.AMBIGUOUS,
                 required=fact.required,
-                explanation="fact had no matchable tokens",
+                explanation="fact had no matchable tokens (non-latin or all stopwords)",
+                missing_information=None,
             )
 
         best_status = FactStatus.MISSING
@@ -160,7 +165,13 @@ class DeterministicCoverageJudge:
             best_status = FactStatus.CONTRADICTED
         elif best_matched == 0:
             best_status = FactStatus.NOT_RETRIEVABLE if not evidence else FactStatus.MISSING
-        elif best_matched >= max(1, int(0.5 * len(fact_tokens))):
+        elif best_matched * 2 >= len(fact_tokens):
+            # Strict "majority overlap" rule: a fact is SUPPORTED only when at
+            # least half of its (matchable) tokens appear in the evidence. Using
+            # `best_matched * 2 >= len` is equivalent to ceil(0.5 * len) and avoids
+            # the old `int(0.5 * len)` floor that let 1/3 (3 tokens→1) or 2/5
+            # (5 tokens→2) token overlaps falsely count as SUPPORTED (build plan
+            # §14.2: "partial information must not be marked fully supported").
             best_status = FactStatus.SUPPORTED
         else:
             best_status = FactStatus.PARTIALLY_SUPPORTED

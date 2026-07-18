@@ -9,6 +9,7 @@ presenting a confident fabricated answer when the judge itself fails.
 """
 
 from agentic_rag_enterprise.answer.envelope import AnswerEnvelope
+from agentic_rag_enterprise.judge.query_fact_extractor import make_required_fact
 from pydantic import BaseModel
 
 
@@ -40,19 +41,47 @@ def false_sufficient(
 ) -> EvalResult:
     """Guard against a falsely ``complete`` answer that hides a missing fact.
 
-    Fires (score 0.0) when the envelope reports ``completeness == "complete"``
-    but, per its attached ``coverage``, at least one *required* fact that the
-    gold answer expects to be missing is in fact ``missing`` / ``contradicted``.
-    A correctly conservative system would never claim ``complete`` in that case.
+    This is the M3 exit-gate guard that catches the failure mode §14.2 forbids
+    ("partial information must not be marked fully supported"): a ``complete``
+    answer when the gold/standard answer expects a required fact to be uncovered.
+
+    Two complementary checks (build plan §14 / M3 acceptance P1-5):
+
+    1. **Real judge-error detection (primary).** If the envelope reports
+       ``completeness == "complete"`` but ``gold_missing_fact_ids`` is non-empty,
+       the answer is a False Sufficient *regardless* of what the system's own
+       coverage says. This catches the case the old metric missed: gold says a
+       fact is missing, the Coverage Judge wrongly marked it ``supported``, and
+       the envelope came back ``complete``.
+    2. **Independent coverage cross-check.** Gold fact references are resolved to
+       their canonical ids (``make_required_fact``) and intersected with the
+       coverage's own ``missing`` / ``contradicted`` sets, so a description-based
+       gold label lines up with the ``fact_<sha>`` ids the runner/coverage use
+       (the dataset keeps human-readable descriptions; conversion is at metric
+       time — no dataset rewrite required).
 
     Args:
         envelope: The produced answer envelope (must carry ``coverage``).
-        gold_missing_fact_ids: Fact ids the gold/standard answer expects to be
-            uncovered for this query (i.e. the answer should NOT be ``complete``).
+        gold_missing_fact_ids: Fact references (descriptions or ids) the gold /
+            standard answer expects to be uncovered for this query (i.e. the
+            answer should NOT be ``complete``).
     """
     if envelope.coverage is None:
         return EvalResult(
             name="false_sufficient", score=1.0, details={"reason": "no coverage attached"}
+        )
+    if envelope.completeness == "complete" and gold_missing_fact_ids:
+        # Primary guard: a `complete` answer while gold expects a missing fact is
+        # a False Sufficient (the judge may have wrongly marked the fact supported).
+        return EvalResult(
+            name="false_sufficient",
+            score=0.0,
+            details={
+                "fired": True,
+                "reason": "complete answer while gold expects a missing fact",
+                "completeness": envelope.completeness,
+                "gold_missing": sorted(gold_missing_fact_ids),
+            },
         )
     if envelope.completeness != "complete":
         return EvalResult(
@@ -61,18 +90,20 @@ def false_sufficient(
             details={"reason": "not complete", "completeness": envelope.completeness},
         )
 
+    # Complete with no gold-missing fact: cross-check the system's own coverage
+    # against gold (id-resolved), as an independent guard.
+    gold_ids = {make_required_fact(g).fact_id for g in gold_missing_fact_ids}
     uncovered = set(envelope.coverage.missing_fact_ids) | set(
         envelope.coverage.contradicted_fact_ids
     )
-    gold = set(gold_missing_fact_ids)
-    fired = bool(gold & uncovered)
+    fired = bool(gold_ids & uncovered)
     return EvalResult(
         name="false_sufficient",
         score=0.0 if fired else 1.0,
         details={
             "fired": fired,
             "uncovered": sorted(uncovered),
-            "gold_missing": sorted(gold),
+            "gold_missing": sorted(gold_missing_fact_ids),
         },
     )
 

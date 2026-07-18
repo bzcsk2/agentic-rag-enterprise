@@ -67,6 +67,30 @@ def _check_tenant_binding(ctx: SecurityContext, result: FastPathResult) -> None:
             )
 
 
+def _check_evidence_binding(
+    ctx: SecurityContext, evidence: tuple[SnapshotEvidence, ...], corpus_id: str
+) -> None:
+    """Fail-closed guard over an *arbitrary* Evidence collection (build plan §12.8).
+
+    The M3 iteration loop accumulates Evidence across rounds (gap-retrieval) and
+    passes it via the ``evidence=`` override. That accumulated set must be bound to
+    the request tenant and the answered corpus exactly like the Fast Path evidence
+    — a cross-tenant / cross-corpus snapshot must never enter the final envelope
+    (this restores the E-013 fail-closed invariant that the M3 loop had regressed).
+    """
+    for ev in evidence:
+        if ev.tenant_id != ctx.tenant_id:
+            raise TenantBindingError(
+                f"Evidence {ev.evidence_id!r} belongs to tenant {ev.tenant_id!r}, "
+                f"not {ctx.tenant_id!r}"
+            )
+        if ev.corpus_id != corpus_id:
+            raise TenantBindingError(
+                f"Evidence {ev.evidence_id!r} belongs to corpus {ev.corpus_id!r}, "
+                f"not {corpus_id!r}"
+            )
+
+
 def _render_answer_from_claims(claims: list[Claim]) -> str:
     """Render the answer text from the kept (supported) claims only.
 
@@ -91,6 +115,7 @@ def build_answer_envelope(
     tool_calls: int = 1,
     missing_aspects: tuple[str, ...] | None = None,
     evidence: tuple[SnapshotEvidence, ...] | None = None,
+    stop_reason: str | None = None,
 ) -> AnswerEnvelope:
     """Build a validated envelope from a Fast Path result and a grounded answer.
 
@@ -132,7 +157,14 @@ def build_answer_envelope(
             tool_calls=tool_calls,
         )
 
-    evidence = evidence if evidence is not None else fast_path_result.evidence
+    effective_evidence = evidence if evidence is not None else fast_path_result.evidence
+    # Fail-closed binding over the *effective* (possibly gap-accumulated) Evidence.
+    # The single-pass path re-validates the same Fast Path evidence; the M3 loop
+    # re-validates the accumulated set so a cross-tenant/cross-corpus gap snapshot
+    # can never reach the envelope (P1-1).
+    _check_evidence_binding(ctx, effective_evidence, fast_path_result.corpus_id)
+
+    evidence = effective_evidence
     evidence_ids = {ev.evidence_id for ev in evidence}
 
     verification = claim_verification or verify_claims(claims or [], evidence_ids)
@@ -142,6 +174,14 @@ def build_answer_envelope(
     # fall back to the E-013 claim-removal heuristic.
     if coverage is not None:
         completeness, confidence = _map_coverage_to_completeness(coverage.overall_status)
+        # Stage B (Claim-Evidence Verifier) can downgrade a Stage-A "complete".
+        # A `complete` answer with no surviving verified claim, or with a removed
+        # critical claim, would regress the E-013 fail-closed rule — so it is
+        # forced down to partial/low (P1-2). Already-partial / conflicted / ambiguous
+        # verdicts are left as the Coverage Judge set them.
+        if verification is not None and completeness == "complete":
+            if not verification.kept_claims or verification.any_critical_unsupported:
+                completeness, confidence = "partial", "low"
         if missing_aspects is None:
             missing_aspects = tuple(
                 fc.missing_information for fc in coverage.fact_coverage if fc.missing_information
@@ -169,6 +209,14 @@ def build_answer_envelope(
     # fail closed to the generic partial response returned by the renderer.
     final_answer = _render_answer_from_claims(verification.kept_claims)
 
+    # For a non-abstain envelope the real loop-termination reason (max_rounds /
+    # no_new_evidence / all_sources_exhausted / sufficient / continue) is surfaced
+    # when provided; otherwise the Fast Path's reason is used (P2-1). The abstain
+    # lock always forces stop_reason == no_evidence and is never overridden here.
+    final_stop_reason = (
+        stop_reason if stop_reason is not None else fast_path_result.stop_reason.value
+    )
+
     return AnswerEnvelope(
         request_id=ctx.request_id,
         session_id=ctx.session_id,
@@ -184,7 +232,7 @@ def build_answer_envelope(
         tool_calls=tool_calls,
         gap_rounds=gap_rounds,
         coverage=coverage,
-        stop_reason=fast_path_result.stop_reason.value,
+        stop_reason=final_stop_reason,
         abstained=False,
     )
 

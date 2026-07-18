@@ -119,12 +119,7 @@ class _EvalModel:
             self._schema = schema
 
         def invoke(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
-            blob = "\n".join(m.get("content", "") for m in messages)
-            ids = list(dict.fromkeys(re.findall(r"\[([A-Za-z0-9_-]+)\]", blob)))
-            claims = [
-                Claim(claim_id=f"c{i}", text=f"finding from {eid}", evidence_ids=(eid,))
-                for i, eid in enumerate(ids)
-            ]
+            claims = _claims_from_messages(messages)
             return ClaimExtraction(draft_answer="\n".join(c.text for c in claims), claims=claims)
 
 
@@ -145,6 +140,29 @@ def _resolve_corpus(corpus_id: str, *, tenant_id: str) -> CorpusConfig:
         created_at=datetime(2024, 1, 1),
         updated_at=datetime(2024, 1, 1),
     )
+
+
+def _claims_from_messages(messages: list[dict[str, str]]) -> list[Claim]:
+    """Extract one ``Claim`` per evidence id from the synthesis prompt.
+
+    The claim text is taken verbatim from the evidence block so it lexically
+    overlaps the cited ``Evidence`` and survives the Stage-B Claim-Evidence
+    Verifier (the old ``finding from <id>`` text never overlapped and was always
+    removed — which would have forced every answer to ``partial`` and masked the
+    Stage-B downgrade behaviour this harness must exercise, P1-2).
+    """
+    blob = "\n".join(m.get("content", "") for m in messages)
+    claims: list[Claim] = []
+    for segment in re.split(r"(?=\[[A-Za-z0-9_-]+\])", blob):
+        match = re.match(r"\[([A-Za-z0-9_-]+)\]\s*[^\n]*\n(.*?)(?:\n\n|\Z)", segment, re.DOTALL)
+        if not match:
+            continue
+        evidence_id = match.group(1)
+        text = match.group(2).strip()
+        if not text:
+            continue
+        claims.append(Claim(claim_id=f"c{len(claims)}", text=text, evidence_ids=(evidence_id,)))
+    return claims
 
 
 def build_required_facts(case: EvalCase) -> list[RequiredFact]:
@@ -188,3 +206,34 @@ def run_case(
         judge=judge,
         required_facts=required,
     )
+
+
+def run_case_baseline(
+    case: EvalCase,
+    *,
+    tenant_id: str = "t1",
+) -> AnswerEnvelope:
+    """Run one eval case through the M2 single-pass Fast Path (no judge / no loop).
+
+    Used by the M3 eval report as the Internal-MVP baseline so the quality gain
+    from the E-019/E-020 iteration loop is measurable (build plan §14 / M3 exit
+    gate). The same hermetic retriever + fake model are reused; only the judge
+    and iteration loop are disabled (``answer`` delegates to the one-pass path).
+    """
+    retriever = _EvalRetriever(case.evidence, tenant_id=tenant_id, corpus_id=case.corpus_id)
+    model = _EvalModel()
+    service = ChatService(
+        retriever=retriever,  # type: ignore[arg-type]
+        dense_encoder=_DummyDenseEncoder(),
+        sparse_encoder=_DummySparseEncoder(),
+        model=model,  # type: ignore[arg-type]
+        resolve_corpus=lambda cid: _resolve_corpus(cid, tenant_id=tenant_id),
+    )
+    ctx = SecurityContext(
+        request_id="eval",
+        session_id="eval",
+        tenant_id=tenant_id,
+        user_id="eval-user",
+        policy_version="1.0",
+    )
+    return service.answer(case.query, ctx, case.corpus_id)

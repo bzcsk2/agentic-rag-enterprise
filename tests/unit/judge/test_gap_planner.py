@@ -49,10 +49,36 @@ def test_no_gap_when_all_supported() -> None:
     assert plan.reason == "no remaining gap queries"
 
 
-def test_not_retrievable_included() -> None:
+def test_not_retrievable_excluded() -> None:
+    # Build plan §14.4: only missing / partially_supported facts are re-queried.
+    # NOT_RETRIEVABLE is NOT retried (it would be a pointless loop).
     cov = SufficiencyResult(
         overall_status="insufficient",
-        fact_coverage=(_fc("z", FactStatus.NOT_RETRIEVABLE),),
+        fact_coverage=(
+            _fc("a", FactStatus.SUPPORTED),
+            _fc("z", FactStatus.NOT_RETRIEVABLE),
+        ),
     )
     plan = GapPlanner().plan(cov, corpus_id="eng")
-    assert plan.queries == ("z",)
+    assert plan.queries == ()
+    assert plan.fact_ids == ()  # NOT_RETRIEVABLE is neither queried nor listed
+
+
+def test_fallback_uses_description_not_hash_id() -> None:
+    # When a missing fact carries no next_queries, the gap query must use the
+    # human-readable description (missing_information), never the hashed fact id.
+    cov = SufficiencyResult(
+        overall_status="partially_sufficient",
+        fact_coverage=(
+            FactCoverage(
+                fact_id="fact_a8b31c0ffee",
+                status=FactStatus.MISSING,
+                required=True,
+                missing_information="vacation policy",
+                next_queries=(),
+            ),
+        ),
+    )
+    plan = GapPlanner().plan(cov, corpus_id="eng")
+    assert plan.queries == ("vacation policy",)
+    assert plan.queries[0] != "fact_a8b31c0ffee"

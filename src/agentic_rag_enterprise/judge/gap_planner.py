@@ -2,10 +2,10 @@
 
 Turns the Coverage Judge result into the next-round retrieval plan. Per §14.4 it
 MUST only emit queries for facts that are still ``missing`` / ``partially_supported``
-(and ``not_retrievable`` — nothing was found for them); it must never re-query for
-already-supported facts, and it must not repeat a query that has already been
-executed. The single answered corpus is the only target (Milestone 3 is
-single-corpus; multi-corpus routing is M4).
+(it must never re-query for already-supported facts, for ``not_retrievable`` facts,
+or for contradicted/ambiguous/policy_blocked facts). It must not repeat a query that
+has already been executed. The single answered corpus is the only target (Milestone
+3 is single-corpus; multi-corpus routing is M4).
 """
 
 from __future__ import annotations
@@ -34,14 +34,17 @@ class GapPlanner:
         fact_ids: list[str] = []
 
         for fc in coverage.fact_coverage:
-            if fc.status not in (
-                FactStatus.MISSING,
-                FactStatus.PARTIALLY_SUPPORTED,
-                FactStatus.NOT_RETRIEVABLE,
-            ):
+            # §14.4: only retry facts that are still missing / partially supported.
+            # NOT_RETRIEVABLE, CONTRADICTED, AMBIGUOUS, POLICY_BLOCKED, SUPPORTED are
+            # not re-queried.
+            if fc.status not in (FactStatus.MISSING, FactStatus.PARTIALLY_SUPPORTED):
                 continue
             fact_ids.append(fc.fact_id)
-            candidate = fc.next_queries[0] if fc.next_queries else fc.fact_id
+            # Use the human-readable gap query (the fact description), never a bare
+            # hashed fact id like "fact_a8b31...".
+            candidate = (
+                fc.next_queries[0] if fc.next_queries else (fc.missing_information or fc.fact_id)
+            )
             if candidate and candidate not in prior:
                 queries.append(candidate)
                 prior.add(candidate)

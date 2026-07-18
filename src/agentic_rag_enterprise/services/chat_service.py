@@ -26,7 +26,7 @@ import logging
 from typing import TYPE_CHECKING, Callable, cast
 
 from agentic_rag_enterprise.answer import build_answer_envelope, conservative_refusal
-from agentic_rag_enterprise.answer.envelope import AnswerEnvelope
+from agentic_rag_enterprise.answer.envelope import AnswerEnvelope, TenantBindingError
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
@@ -217,11 +217,18 @@ class ChatService:
             ev.evidence_id: ev for ev in first_result.evidence
         }
         seen_ids: set[str] = set(evidence_by_id)
+        # Seed novelty trackers with round-0 evidence so a repeated gap snapshot
+        # (same text / same doc version) is not mistaken for new evidence (P2-2).
+        seen_text_hashes: set[str] = {ev.text_hash for ev in first_result.evidence}
+        seen_doc_versions: set[tuple[str, str]] = {
+            (ev.document_id, ev.document_version) for ev in first_result.evidence
+        }
         prior_queries = [query]
         coverage: SufficiencyResult | None = None
         gap_rounds = 0
         retrieval_calls = 1  # round 0 counts as one retrieval pass
         prev_covered: set[str] = set()
+        final_reason = first_result.stop_reason.value  # real termination reason (P2-1)
 
         for round_idx in range(max_rounds):
             gap_rounds = round_idx + 1
@@ -230,15 +237,14 @@ class ChatService:
                 # Already retrieved via run_fast_path; everything is "new" this round.
                 new_evidence_ids: set[str] = set(seen_ids)
                 round_queries: list[str] = [query]
+                round_new_content = False
             else:
                 # Coverage is always set by round 0's judge call above.
                 assert coverage is not None
                 plan = gap_planner.plan(coverage, prior_queries=prior_queries, corpus_id=corpus_id)
                 round_queries = list(plan.queries)
-                if not round_queries:
-                    # No remaining gap queries → nothing left to retrieve for.
-                    break
                 new_evidence_ids = set()
+                round_new_content = False
                 for q in round_queries:
                     try:
                         evs = self._retriever.retrieve_evidence(
@@ -256,10 +262,37 @@ class ChatService:
                         ) from exc
                     retrieval_calls += 1
                     for ev in evs:
-                        if ev.evidence_id not in seen_ids:
+                        # Fail-closed: a gap snapshot from another tenant/corpus must
+                        # never enter the answer (P1-1). This mirrors the E-013
+                        # cross-tenant guard that the M3 accumulation had regressed.
+                        if ev.tenant_id != ctx.tenant_id or ev.corpus_id != corpus.corpus_id:
+                            raise TenantBindingError(
+                                f"gap evidence {ev.evidence_id!r} tenant/corpus "
+                                f"({ev.tenant_id}/{ev.corpus_id}) does not match request "
+                                f"({ctx.tenant_id}/{corpus.corpus_id})"
+                            )
+                        existing = evidence_by_id.get(ev.evidence_id)
+                        if existing is None:
                             seen_ids.add(ev.evidence_id)
                             evidence_by_id[ev.evidence_id] = ev
                             new_evidence_ids.add(ev.evidence_id)
+                        elif (
+                            existing.document_version != ev.document_version
+                            or existing.text_hash != ev.text_hash
+                        ):
+                            # Same id but an updated snapshot: keep the latest version
+                            # so a new document version / new text is reflected in the
+                            # answer (§14.6); the gain signal is `round_new_content`.
+                            evidence_by_id[ev.evidence_id] = ev
+                        # §14.6 novelty: a new document version or new text hash is a
+                        # genuine gain even when the id was already seen (P2-2).
+                        if (
+                            ev.text_hash not in seen_text_hashes
+                            or (ev.document_id, ev.document_version) not in seen_doc_versions
+                        ):
+                            round_new_content = True
+                        seen_text_hashes.add(ev.text_hash)
+                        seen_doc_versions.add((ev.document_id, ev.document_version))
                     if q not in prior_queries:
                         prior_queries.append(q)
 
@@ -296,7 +329,9 @@ class ChatService:
                 new_covered_fact_ids=new_covered,
                 judge_ok=True,
                 budget_remaining=1.0,
+                new_content=round_new_content,
             )
+            final_reason = decision.reason  # surface the real stop reason (P2-1)
             if decision.should_stop:
                 break
 
@@ -311,6 +346,7 @@ class ChatService:
             gap_rounds=gap_rounds,
             iterations=gap_rounds,
             tool_calls=retrieval_calls,
+            stop_reason=final_reason,
         )
 
     def _run_single_pass(
@@ -357,12 +393,16 @@ class ChatService:
         gap_rounds: int = 1,
         iterations: int = 1,
         tool_calls: int = 1,
+        stop_reason: str | None = None,
     ) -> AnswerEnvelope:
         """Run LLM claim extraction + Stage B verification, then build the envelope.
 
         The model prompt carries the (accumulated) evidence so claims can cite it.
         When ``coverage`` is present, Stage B (``DeterministicClaimEvidenceVerifier``)
         assigns each kept claim a ``support_status`` and the verdict is attached.
+        ``stop_reason`` (when provided) is the real loop-termination reason and is
+        surfaced on non-abstain envelopes (P2-1); abstain envelopes always lock to
+        ``no_evidence`` and ignore it.
         """
         synthesis_evidence = evidence if evidence is not None else fast_path_result.evidence
         messages = _build_messages(query, synthesis_evidence)
@@ -391,4 +431,5 @@ class ChatService:
             iterations=iterations,
             tool_calls=tool_calls,
             evidence=evidence,
+            stop_reason=stop_reason,
         )

@@ -58,3 +58,20 @@ def test_dangling_evidence_id_removed() -> None:
     res = DeterministicClaimEvidenceVerifier().verify(claims, tuple(ev))
     assert res.kept_claims == []
     assert res.removed_claims[0].support_status == "unsupported"
+
+
+def test_critical_unsupported_flagged() -> None:
+    # A removed *critical* claim must be flagged so the builder can downgrade a
+    # `complete` verdict (Stage B -> Stage A reconciliation, P1-2).
+    claims = [
+        Claim(
+            claim_id="c1",
+            text="vacation policy grants 20 days",
+            evidence_ids=("e1",),
+            importance="critical",
+        )
+    ]
+    ev = [_ev("e1", "the weather is sunny")]  # no lexical overlap -> removed
+    res = DeterministicClaimEvidenceVerifier().verify(claims, tuple(ev))
+    assert res.kept_claims == []
+    assert res.any_critical_unsupported is True

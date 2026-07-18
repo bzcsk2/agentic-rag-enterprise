@@ -19,7 +19,7 @@ from datetime import datetime
 
 import pytest
 
-from agentic_rag_enterprise.answer.envelope import Claim
+from agentic_rag_enterprise.answer.envelope import Claim, TenantBindingError
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
@@ -56,17 +56,23 @@ def _corpus(corpus_id: str = "eng", tenant_id: str = "t1") -> CorpusConfig:
     )
 
 
-def _evidence(evidence_id: str, text: str, tenant_id: str = "t1") -> SnapshotEvidence:
+def _evidence(
+    evidence_id: str,
+    text: str,
+    tenant_id: str = "t1",
+    corpus_id: str = "eng",
+    document_version: str = "v1",
+) -> SnapshotEvidence:
     return SnapshotEvidence(
         evidence_id=evidence_id,
         tenant_id=tenant_id,
-        corpus_id="eng",
+        corpus_id=corpus_id,
         document_id="d1",
-        document_version="v1",
+        document_version=document_version,
         source_uri="inline://d1",
         source_filename="d1.md",
         text=text,
-        text_hash="h",
+        text_hash=f"h-{evidence_id}",
         retrieval_query="q",
         authority_level=50,
         retrieved_at=datetime(2024, 1, 1),
@@ -139,13 +145,29 @@ class _LoopModel:
 
         def invoke(self, messages: list[dict[str, str]], **kwargs: object):
             self._model.last_messages = messages
-            blob = "\n".join(m.get("content", "") for m in messages)
-            ids = list(dict.fromkeys(re.findall(r"\[([A-Za-z0-9_-]+)\]", blob)))
-            claims = [
-                Claim(claim_id=f"c{i}", text=f"finding from {eid}", evidence_ids=(eid,))
-                for i, eid in enumerate(ids)
-            ]
+            claims = _claims_from_messages(messages)
             return ClaimExtraction(draft_answer="\n".join(c.text for c in claims), claims=claims)
+
+
+def _claims_from_messages(messages: list[dict[str, str]]) -> list[Claim]:
+    """Emit one ``Claim`` per evidence id whose text is the cited evidence text.
+
+    Mirrors the eval runner: the claim text overlaps the evidence so it survives
+    the Stage-B verifier (the old ``finding from <id>`` text never overlapped and
+    would have forced every answer to ``partial``, masking the Stage-B downgrade).
+    """
+    blob = "\n".join(m.get("content", "") for m in messages)
+    claims: list[Claim] = []
+    for segment in re.split(r"(?=\[[A-Za-z0-9_-]+\])", blob):
+        match = re.match(r"\[([A-Za-z0-9_-]+)\]\s*[^\n]*\n(.*?)(?:\n\n|\Z)", segment, re.DOTALL)
+        if not match:
+            continue
+        evidence_id = match.group(1)
+        text = match.group(2).strip()
+        if not text:
+            continue
+        claims.append(Claim(claim_id=f"c{len(claims)}", text=text, evidence_ids=(evidence_id,)))
+    return claims
 
 
 def _service(retriever: _FakeLoopRetriever, model: _LoopModel | None = None) -> ChatService:
@@ -301,10 +323,98 @@ def test_no_new_evidence_stops_early() -> None:
         judge=DeterministicCoverageJudge(),
         required_facts=_facts("alpha requirement", "gamma specification"),
     )
-    # Stopped at round 2 (no_new_evidence), well before max_rounds=5.
-    assert env.gap_rounds == 2
-    assert len(retriever.calls) == 2
+    # Build plan §14.5/§14.6: two consecutive no-gain rounds -> no_new_evidence.
+    # Round 0 gains (initial evidence); rounds 1 and 2 are no-gain -> stop at
+    # round 2 (3 total rounds), well before max_rounds=5.
+    assert env.gap_rounds == 3
+    assert len(retriever.calls) == 3
     assert env.completeness == "partial"
+    assert env.stop_reason == "no_new_evidence"
+
+
+def test_gap_retrieval_rejects_cross_tenant_evidence() -> None:
+    # Round 0 returns tenant-t1 evidence; a gap query returns tenant-t2 evidence.
+    # The accumulated gap snapshot must never enter the answer (P1-1): fail closed
+    # with TenantBindingError before any model prompt / envelope.
+    retriever = _FakeLoopRetriever(
+        {
+            "q": [_evidence("e1", "The alpha requirement is met.", tenant_id="t1")],
+            "gamma specification": [_evidence("e2", "gamma detail", tenant_id="t2")],
+        }
+    )
+    with pytest.raises(TenantBindingError):
+        _service(retriever).answer_with_iteration(
+            "q",
+            _ctx(tenant_id="t1"),
+            "eng",
+            max_rounds=3,
+            judge=DeterministicCoverageJudge(),
+            required_facts=_facts("alpha requirement", "gamma specification"),
+        )
+
+
+def test_gap_retrieval_rejects_cross_corpus_evidence() -> None:
+    # A gap snapshot belonging to a different corpus must be rejected (P1-1).
+    retriever = _FakeLoopRetriever(
+        {
+            "q": [_evidence("e1", "The alpha requirement is met.", corpus_id="eng")],
+            "gamma specification": [_evidence("e2", "gamma detail", corpus_id="other")],
+        }
+    )
+    with pytest.raises(TenantBindingError):
+        _service(retriever).answer_with_iteration(
+            "q",
+            _ctx(),
+            "eng",
+            max_rounds=3,
+            judge=DeterministicCoverageJudge(),
+            required_facts=_facts("alpha requirement", "gamma specification"),
+        )
+
+
+def test_max_rounds_reason_recorded() -> None:
+    # The real termination reason must be surfaced on the non-abstain envelope
+    # (P2-1), not the always-"evidence_found" Fast Path reason.
+    retriever = _FakeLoopRetriever(
+        {
+            "q": [_evidence("e1", "The alpha requirement is met.")],
+            "gamma specification": [_evidence("e2", "unrelated sigma information.")],
+        }
+    )
+    env = _service(retriever).answer_with_iteration(
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=2,
+        judge=DeterministicCoverageJudge(),
+        required_facts=_facts("alpha requirement", "gamma specification"),
+    )
+    assert env.abstained is False
+    assert env.stop_reason == "max_rounds"
+
+
+def test_new_document_version_counts_as_gain() -> None:
+    # Same evidence id returned in the gap round but with a NEW document version
+    # must be treated as new content (§14.6) and accumulated into the answer,
+    # proving id-only novelty is not used (P2-2).
+    retriever = _FakeLoopRetriever(
+        {
+            "q": [_evidence("e1", "The alpha requirement is met.", document_version="v1")],
+            "gamma specification": [
+                _evidence("e1", "The alpha requirement is met, revised.", document_version="v2")
+            ],
+        }
+    )
+    env = _service(retriever).answer_with_iteration(
+        "q",
+        _ctx(),
+        "eng",
+        max_rounds=4,
+        judge=DeterministicCoverageJudge(),
+        required_facts=_facts("alpha requirement", "gamma specification"),
+    )
+    assert any(e.document_version == "v2" for e in env.evidence)
+    assert env.gap_rounds >= 2
 
 
 def test_gap_retrieval_completes_the_answer() -> None:
