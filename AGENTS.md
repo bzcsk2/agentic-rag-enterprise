@@ -85,37 +85,50 @@
     (Corpus/Capability Registry + three Corpus fixtures + permission-safe discoverability) CLOSED.**
     **E-016** (permission-aware soft router + cross-Corpus retrieval merge + dedup) —
     original implementation CLOSED at `67280a1`; a code-level audit returned **FAIL**
-    (4 P1 + 3 P2) and the remediation is CLOSED at the current commit. Adds
-    `corpus/router.py` (`CorpusRouter` — deterministic, model-free, **query-sensitive**
-    ranking per build plan §9.3: `score = 0.7*relevance + 0.3*(authority/100)` clamped
-    `[0,1]`, `relevance` = normalized stopword-filtered token overlap of the query vs the
-    corpus name/description/domain/id/capabilities; emits `route_confidence`
-    (high/medium/low) + `fallback_search` and applies high→Top-1 / medium→Top-2 /
-    low→Top-3+fallback; input is ONLY `registry.resolve_candidates`, never the full corpus
-    map) and `retrieval/multi_corpus.py` (`MultiCorpusRetrieval` runs the existing
+    (4 P1 + 3 P2), remediated and a **second** re-audit also returned **FAIL** (4 P1
+    residual, focus on fallback + fault classification), now CLOSED at the current
+    commit. Adds `corpus/router.py` (`CorpusRouter` — deterministic, model-free,
+    **query-sensitive** ranking per build plan §9.3: `score = 0.7*relevance +
+    0.3*(authority/100)` clamped `[0,1]`, `relevance` = normalized stopword-filtered
+    token overlap of the query vs the corpus name/description/domain/id/capabilities;
+    emits `route_confidence` (high/medium/low) + `fallback_search` + `fallback_candidates`
+    and applies high→Top-1 / medium→Top-2 / low→Top-3+fallback; input is ONLY
+    `registry.resolve_candidates`, never the full corpus map) and
+    `retrieval/multi_corpus.py` (`MultiCorpusRetrieval` runs the existing
     `SecureRetriever.retrieve_evidence` once per selected corpus with the shared
-    `SecurityContext`; `merge_evidence` is two-layer — stable `evidence_id`
-    first-occurrence dedup THEN cross-id same-`(text_hash, document_id, document_version)`
-    fold to higher authority (loser corpus still recorded in `corpora_used`), different
-    version never folded, fully deterministic). **Remediated fault semantics**: only
-    explicit backend faults become `CorpusRetrievalFault` (never "no Evidence");
+    `SecurityContext`; `merge_evidence` now returns a `MergeResult` with two layers —
+    stable `evidence_id` first-occurrence dedup THEN cross-id same-`(text_hash,
+    document_id, document_version)` fold to higher authority; `contributing_corpora`
+    credits only corpora that emitted a surviving primary/folded Evidence, so a corpus
+    whose raw snapshots were all stable-id duplicates is not over-counted (P2-1);
+    different version never folded, fully deterministic). **Explicit fault boundary**:
+    `retrieval/backend_fault.py` classifies a per-corpus failure; only
+    `RetrievalBackendError` (or a curated infra set: `ConnectionError`/`TimeoutError`/
+    qdrant `UnexpectedResponse`/`ResponseHandlingException`) becomes a
+    `CorpusRetrievalFault` — **never** `ValueError`/`TypeError`/programming bugs;
     security/authorization/binding errors (`CorpusNotDiscoverableError`,
     `ParentAuthorizationError`, `EmptyAuthorizationScopeError`, `TenantBindingError`)
     propagate fail-closed even when a sibling succeeds; a total fault
-    (`len(faults)==len(corpora)`) raises while a single-fault-plus-empty-sibling does not;
-    every returned snapshot is re-bound to the requested tenant/corpus (`TenantBindingError`
-    on mismatch); `retrieval_calls` tracks the true call count.
-    `services/chat_service.py` `answer_multi_corpus(query, ctx, *, corpus_ids=None)` sources
-    the retrieval `CorpusConfig` ONLY from `registry.get(...)` (routed + explicit; legacy
-    `_resolve_corpus` never on this path), routes → retrieves → single-pass synthesizes via
-    `answer/builder.py:build_multi_corpus_envelope`, and on partial fault degrades the
-    envelope from complete/high to partial/medium with an explicit partial-retrieval
-    `limitations` entry (never reported as unconditionally complete); `tool_calls` =
-    `retrieval_calls`. The single-corpus `answer()` / `answer_with_iteration`, the E-012 Fast
-    Path and the E-013/E-019/E-020 abstain lock are unchanged. `AnswerEnvelope.corpora_used`
-    reflects only corpora that actually contributed Evidence. Full contract at
-    `docs/issue-e016-contract.md`. Explicitly **excludes** Planner DAG, Required-Fact Judge,
-    iteration, authority/freshness conflict arbitration, and SQL/API/graph capability (those
+    (`len(faults)==len(corpora)`) raises while a single-fault-plus-empty-sibling does
+    not; every returned snapshot is re-bound to the requested tenant/corpus
+    (`TenantBindingError` on mismatch); `retrieval_calls` tracks the true call count.
+    `services/chat_service.py` `answer_multi_corpus(query, ctx, *, corpus_ids=None,
+    router_limit=None)` sources the retrieval `CorpusConfig` ONLY from `registry.get(...)`
+    (routed + explicit + fallback; legacy `_resolve_corpus` never on this path); on a
+    **high-confidence Top-1 empty it expands to the Top-2 fallback candidate and retries
+    once** (§9.3 — never hard-route a miss to "no answer"); security/binding errors are
+    re-raised in their original type before any wrapping (never relabelled as
+    `FastPathBackendError`); a partial fault *with no surviving evidence* raises rather
+    than emitting a plain `no_evidence` abstain (P1-4); otherwise it routes → retrieves →
+    single-pass synthesizes via `answer/builder.py:build_multi_corpus_envelope` and on
+    partial fault degrades the envelope from complete/high to partial/medium with an
+    explicit partial-retrieval `limitations` entry (never unconditionally complete);
+    `tool_calls` = `retrieval_calls`. The single-corpus `answer()` / `answer_with_iteration`,
+    the E-012 Fast Path and the E-013/E-019/E-020 abstain lock are unchanged.
+    `AnswerEnvelope.corpora_used` reflects only corpora that actually contributed Evidence.
+    Full contract at `docs/issue-e016-contract.md`. Explicitly **excludes** Planner DAG,
+    Required-Fact Judge, iteration, authority/freshness conflict arbitration, and
+    SQL/API/graph capability (those
     are M5 / E-017 → E-018).
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.

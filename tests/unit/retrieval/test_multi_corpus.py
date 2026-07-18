@@ -11,6 +11,7 @@ from agentic_rag_enterprise.retrieval.multi_corpus import (
     MultiCorpusRetrieval,
     merge_evidence,
 )
+from agentic_rag_enterprise.retrieval.models import RetrievalBackendError
 from agentic_rag_enterprise.storage.vector_store import DenseEncoder, SparseEncoder
 
 
@@ -96,7 +97,7 @@ class _FakeRetriever:
 
 
 class _FaultyRetriever:
-    """Fake that raises for a configured set of corpus ids."""
+    """Fake that raises a *backend* fault for a configured set of corpus ids."""
 
     def __init__(self, raise_for: set[str], ok: dict[str, list[SnapshotEvidence]]) -> None:
         self._raise_for = raise_for
@@ -115,7 +116,7 @@ class _FaultyRetriever:
         plan_step_id: object = None,
     ) -> list[SnapshotEvidence]:
         if corpus.corpus_id in self._raise_for:
-            raise RuntimeError(f"backend down for {corpus.corpus_id}")
+            raise RetrievalBackendError(f"backend down for {corpus.corpus_id}")
         return list(self._ok.get(corpus.corpus_id, []))
 
 
@@ -132,9 +133,11 @@ def test_merge_dedup_by_evidence_id() -> None:
     a = _evidence("e1", "same text", corpus_id="product_docs", text_hash="H")
     b = _evidence("e1", "same text", corpus_id="engineering_wiki", text_hash="H")
     merged = merge_evidence({"product_docs": [a], "engineering_wiki": [b]})
-    # Same id → one survivor; both corpora still recorded via contribution.
-    assert len(merged) == 1
-    assert merged[0].evidence_id == "e1"
+    # Same id → one survivor (first occurrence by corpus_id asc = engineering_wiki);
+    # only the surviving snapshot's corpus contributes.
+    assert len(merged.evidence) == 1
+    assert merged.evidence[0].evidence_id == "e1"
+    assert merged.contributing_corpora == ("engineering_wiki",)
 
 
 def test_merge_folds_same_text_diff_version_not_collapsed() -> None:
@@ -142,7 +145,7 @@ def test_merge_folds_same_text_diff_version_not_collapsed() -> None:
     b = _evidence("e2", "identical", corpus_id="c2", document_version="v2", text_hash="H")
     merged = merge_evidence({"c1": [a], "c2": [b]})
     # Different document_version is NOT folded.
-    assert len(merged) == 2
+    assert len(merged.evidence) == 2
 
 
 def test_merge_folds_same_text_same_version_keeps_higher_authority() -> None:
@@ -150,9 +153,10 @@ def test_merge_folds_same_text_same_version_keeps_higher_authority() -> None:
     b = _evidence("e2", "identical", corpus_id="tickets", text_hash="H", authority_level=40)
     merged = merge_evidence({"product_docs": [a], "tickets": [b]})
     # One primary survivor (higher authority = product_docs), both corpora recorded.
-    assert len(merged) == 1
-    assert merged[0].corpus_id == "product_docs"
-    assert merged[0].authority_level == 80
+    assert len(merged.evidence) == 1
+    assert merged.evidence[0].corpus_id == "product_docs"
+    assert merged.evidence[0].authority_level == 80
+    assert merged.contributing_corpora == ("product_docs", "tickets")
 
 
 def test_merge_deterministic_order() -> None:
@@ -160,8 +164,8 @@ def test_merge_deterministic_order() -> None:
     b = _evidence("e2", "t2", corpus_id="tickets", text_hash="h2")
     merged1 = merge_evidence({"product_docs": [a], "tickets": [b]})
     merged2 = merge_evidence({"tickets": [b], "product_docs": [a]})
-    assert [e.evidence_id for e in merged1] == [e.evidence_id for e in merged2]
-    assert [e.evidence_id for e in merged1] == ["e1", "e2"]  # corpus_id asc order
+    assert [e.evidence_id for e in merged1.evidence] == [e.evidence_id for e in merged2.evidence]
+    assert [e.evidence_id for e in merged1.evidence] == ["e1", "e2"]  # corpus_id asc order
 
 
 # -- MultiCorpusRetrieval --------------------------------------------------------
@@ -221,7 +225,7 @@ def test_retrieve_partial_fault_keeps_other_evidence() -> None:
     assert len(result.evidence) == 1
     assert len(result.faults) == 1
     assert result.faults[0].corpus_id == "product_docs"
-    assert result.faults[0].error_type == "RuntimeError"
+    assert result.faults[0].error_type == "RetrievalBackendError"
 
 
 def test_retrieve_total_fault_raises() -> None:
@@ -236,8 +240,56 @@ def test_retrieve_total_fault_raises() -> None:
             dense_encoder=de,
             sparse_encoder=se,
         )
-        raise AssertionError("expected RuntimeError to propagate")
-    except RuntimeError:
+        raise AssertionError("expected RetrievalBackendError to propagate")
+    except RetrievalBackendError:
+        pass
+
+
+class _NonBackendFaultRetriever:
+    """Raises a programming error (NOT a backend fault) for a corpus id."""
+
+    def __init__(self, raise_for: set[str], ok: dict[str, list[SnapshotEvidence]]) -> None:
+        self._raise_for = raise_for
+        self._ok = ok
+
+    def retrieve_evidence(
+        self,
+        ctx: SecurityContext,
+        query: str,
+        corpus: CorpusConfig,
+        top_k: object = None,
+        *,
+        dense_encoder: DenseEncoder,
+        sparse_encoder: SparseEncoder,
+        iteration: int = 0,
+        plan_step_id: object = None,
+    ) -> list[SnapshotEvidence]:
+        if corpus.corpus_id in self._raise_for:
+            # A plain ValueError/KeyError/TypeError is a bug, not an infra fault.
+            raise ValueError(f"programming error for {corpus.corpus_id}")
+        return list(self._ok.get(corpus.corpus_id, []))
+
+
+def test_retrieve_non_backend_exception_propagates_not_faulted() -> None:
+    """P1-3: only RetrievalBackendError (or classified infra) is a fault.
+
+    A programming error from one corpus must NOT be downgraded to a partial fault;
+    it propagates so a sibling's evidence can never mask a real bug.
+    """
+    ok = {"engineering_wiki": [_evidence("eb", "b", corpus_id="engineering_wiki")]}
+    retriever = _NonBackendFaultRetriever(raise_for={"product_docs"}, ok=ok)
+    mc = MultiCorpusRetrieval(retriever)  # type: ignore[arg-type]
+    de, se = _encoders()
+    try:
+        mc.retrieve(
+            _ctx(),
+            "q",
+            [_corpus("product_docs"), _corpus("engineering_wiki")],
+            dense_encoder=de,
+            sparse_encoder=se,
+        )
+        raise AssertionError("expected ValueError to propagate")
+    except ValueError:
         pass
 
 
@@ -267,9 +319,11 @@ def test_merge_same_id_diff_hash_first_occurrence_wins() -> None:
     a = _evidence("e1", "old", corpus_id="c1", text_hash="old", document_version="v1")
     b = _evidence("e1", "new", corpus_id="c2", text_hash="new", document_version="v2")
     merged = merge_evidence({"c1": [a], "c2": [b]})
-    assert len(merged) == 1
-    assert merged[0].text_hash == "old"
-    assert merged[0].document_version == "v1"
+    assert len(merged.evidence) == 1
+    assert merged.evidence[0].text_hash == "old"
+    assert merged.evidence[0].document_version == "v1"
+    # Only the contributor of the surviving snapshot is credited (P2-1).
+    assert merged.contributing_corpora == ("c1",)
 
 
 def test_merge_same_id_diff_version_not_duplicated() -> None:
@@ -277,8 +331,8 @@ def test_merge_same_id_diff_version_not_duplicated() -> None:
     b = _evidence("e1", "t", corpus_id="c2", text_hash="h2", document_version="v2")
     merged = merge_evidence({"c1": [a], "c2": [b]})
     # Same id → never two survivors, even across versions.
-    assert len(merged) == 1
-    ids = [e.evidence_id for e in merged]
+    assert len(merged.evidence) == 1
+    ids = [e.evidence_id for e in merged.evidence]
     assert ids == ["e1"]
 
 
@@ -286,8 +340,23 @@ def test_merge_same_id_diff_corpus_first_wins() -> None:
     a = _evidence("e1", "t", corpus_id="c1", text_hash="h1")
     b = _evidence("e1", "t", corpus_id="c2", text_hash="h1")
     merged = merge_evidence({"c1": [a], "c2": [b]})
-    assert len(merged) == 1
-    assert merged[0].corpus_id == "c1"
+    assert len(merged.evidence) == 1
+    assert merged.evidence[0].corpus_id == "c1"
+
+
+def test_contributing_corpora_excludes_only_stable_id_duplicates() -> None:
+    """P2-1: a corpus whose raw snapshots were ALL dropped by stable-id dedup is
+    not credited in ``contributing_corpora`` / ``corpora_used``.
+
+    c1 contributes a unique survivor; c2 returns only evidence whose id already
+    appeared in c1 (different text, but Layer-1 dedup drops it). c2 must not be
+    counted as a contributor.
+    """
+    a = _evidence("e1", "real answer", corpus_id="c1", text_hash="h1")
+    dup = _evidence("e1", "ignored", corpus_id="c2", text_hash="h2")
+    merged = merge_evidence({"c1": [a], "c2": [dup]})
+    assert len(merged.evidence) == 1
+    assert merged.contributing_corpora == ("c1",)
 
 
 # -- P1-4.1: one fault + one legitimately-empty is NOT a total outage -------------

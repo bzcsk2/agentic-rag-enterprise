@@ -134,6 +134,11 @@ class CorpusRoute:
     candidates: tuple[CorpusCandidate, ...]
     route_confidence: RouteConfidence
     fallback_search: bool
+    # Extra ranked candidates *beyond* the primary policy count, for §9.3 fallback
+    # expansion (e.g. a ``high`` route's primary is Top-1; the next-best corpus is
+    # exposed here so the caller may expand to Top-2 when the primary returns
+    # nothing). Empty unless there is a further-ranked corpus to try.
+    fallback_candidates: tuple[CorpusCandidate, ...]
     truncated_from: int
 
 
@@ -181,12 +186,17 @@ class CorpusRouter:
         confidence, policy_count, fallback = self._classify(scored)
         take = policy_count if limit is None else min(policy_count, limit)
         selected = scored[:take]
+        # The next-ranked corpora beyond the primary policy count are offered as
+        # fallback expansion candidates (Top-1 → Top-2 etc.) when the primary is
+        # empty. Capped to one extra corpus for the §9.3 single-step expansion.
+        fallback_cands = tuple(scored[take : take + 1]) if take < len(scored) else ()
 
         return CorpusRoute(
             query=query,
             candidates=tuple(selected),
             route_confidence=confidence,
             fallback_search=fallback,
+            fallback_candidates=fallback_cands,
             truncated_from=len(candidates),
         )
 

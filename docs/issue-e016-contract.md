@@ -156,39 +156,49 @@ MultiCorpusRetrieval.retrieve(
 - For each selected corpus, call `SecureRetriever.retrieve_evidence` with the same
   `ctx`. Propagate the *same* `SecurityContext` so per-corpus tenant/ACL/active-version/
   parent-second-auth all apply.
-- **Fault handling** (fail-loud, never fail-open):
-  - Only *explicit backend / infrastructure* faults are captured as a
-    `CorpusRetrievalFault` and never relabelled as "no Evidence"; the other corpora's
-    evidence is still returned.
-  - **Security / authorization / binding / configuration errors propagate
-    immediately** (`CorpusNotDiscoverableError`, `ParentAuthorizationError`,
-    `EmptyAuthorizationScopeError`, `TenantBindingError`). They are never downgraded
-    to a partial fault, even when a sibling corpus succeeds — a denial is never
-    masked.
-  - `retrieve` raises **only when every selected corpus faults** (`len(faults) ==
-    len(corpora)`) — a single fault alongside a legitimately-empty sibling is NOT a
-    total outage.
-  - **Cross-corpus Evidence binding** — every returned snapshot is re-checked to
-    match the requested tenant and the corpus it was requested from; a mismatch is a
-    `TenantBindingError` (security violation), never a fault, never merged.
-  - `MultiCorpusResult.retrieval_calls` records the true number of per-corpus
-    retrieval calls executed (for a truthful envelope `tool_calls`).
-- **Merge & dedup** (`merge_evidence`) — two layers, deterministic:
-  - Iterate corpora in ascending `corpus_id` order, evidence in input order.
-  - **Layer 1 — stable `evidence_id` dedup, first occurrence wins.** A repeated
-    `evidence_id` is dropped *before* content folding, so one `evidence_id` can never
-    map to two non-interchangeable snapshots (different text/version/corpus). First
-    occurrence (corpus_id asc, then input order) is authoritative.
-  - **Layer 2 — cross-id same-content folding.** Two Evidence sharing
-    `(text_hash, document_id, document_version)` but a *different* `evidence_id`
-    collapse to the higher `authority_level` (tie → existing survivor). The loser's
-    `corpus_id` is still recorded (source attribution preserved), but only one
-    primary Evidence is emitted.
-  - **Different `document_version` is NOT folded** — same text, different version
-    stays as distinct Evidence.
-  - `corpora_used` = corpora that contributed (primary OR folded) evidence, in
-    ascending order. `insufficient_corpora` = routed corpora that returned zero
-    evidence and did not fault.
+  - **Fault handling** (fail-loud, never fail-open, explicit type boundary):
+    - `MultiCorpusRetrieval` catches **only** `RetrievalBackendError` (a new,
+      explicit backend/infrastructure exception type in `retrieval/models.py`).
+      Adapter code raises it for genuine infra faults; a curated set of transport
+      errors (`ConnectionError`, `TimeoutError`, qdrant `UnexpectedResponse` /
+      `ResponseHandlingException`) is converted to it by `retrieval/backend_fault.py`.
+      A backend fault is captured as a `CorpusRetrievalFault` and never relabelled as
+      "no Evidence"; the other corpora's evidence is still returned.
+    - **Security / authorization / binding / configuration errors propagate
+      immediately** (`CorpusNotDiscoverableError`, `ParentAuthorizationError`,
+      `EmptyAuthorizationScopeError`, `TenantBindingError`). They are never downgraded
+      to a partial fault, even when a sibling corpus succeeds — a denial is never
+      masked.
+    - **Programming errors (`ValueError` / `TypeError` / `KeyError` / `AssertionError`
+      / adapter bugs) are NOT captured** — they propagate untouched, so a sibling's
+      evidence can never mask a real bug (this is the explicit type boundary that
+      replaces the old broad `except Exception`).
+    - `retrieve` raises **only when every selected corpus faults** (`len(faults) ==
+      len(corpora)`) — a single fault alongside a legitimately-empty sibling is NOT a
+      total outage.
+    - **Cross-corpus Evidence binding** — every returned snapshot is re-checked to
+      match the requested tenant and the corpus it was requested from; a mismatch is a
+      `TenantBindingError` (security violation), never a fault, never merged.
+    - `MultiCorpusResult.retrieval_calls` records the true number of per-corpus
+      retrieval calls executed (for a truthful envelope `tool_calls`).
+  - **Merge & dedup** (`merge_evidence` → `MergeResult`) — two layers, deterministic:
+    - Iterate corpora in ascending `corpus_id` order, evidence in input order.
+    - **Layer 1 — stable `evidence_id` dedup, first occurrence wins.** A repeated
+      `evidence_id` is dropped *before* content folding, so one `evidence_id` can never
+      map to two non-interchangeable snapshots (different text/version/corpus). First
+      occurrence (corpus_id asc, then input order) is authoritative.
+    - **Layer 2 — cross-id same-content folding.** Two Evidence sharing
+      `(text_hash, document_id, document_version)` but a *different* `evidence_id`
+      collapse to the higher `authority_level` (tie → existing survivor). The loser's
+      `corpus_id` is still marked as contributed (source attribution preserved), but
+      only one primary Evidence is emitted.
+    - **Different `document_version` is NOT folded** — same text, different version
+      stays as distinct Evidence.
+    - `MergeResult.contributing_corpora` = the corpora that emitted at least one
+      *surviving* primary or folded Evidence. A corpus whose raw snapshots were all
+      dropped by Layer-1 stable-id dedup does **not** count — `corpora_used` reflects
+      real contribution, not "returned some raw rows" (P2-1). `insufficient_corpora` =
+      routed corpora that returned zero evidence and did not fault.
 
 ### Chat service (`services/chat_service.py`)
 
@@ -199,26 +209,41 @@ ChatService.answer_multi_corpus(
 ```
 
 - When `corpus_ids` is `None`, route via `CorpusRouter.route(query, ctx, registry)`
-  (the §9.3 policy decides the count — Top-1/2/3) and use the selected `candidates`.
-  Otherwise restrict to the explicitly requested (and still discoverable)
-  `corpus_ids`. A requested-but-undiscoverable corpus fails closed (never silently
-  dropped into retrieval).
+  (the §9.3 policy decides the count — Top-1/2/3; `router_limit` defaults to `None`
+  so the policy is never truncated by a hard `limit=2`). Use the selected
+  `candidates`. Otherwise restrict to the explicitly requested (and still
+  discoverable) `corpus_ids`. A requested-but-undiscoverable corpus fails closed
+  (never silently dropped into retrieval).
+- **§9.3 fallback expansion** — the `CorpusRoute` exposes a `fallback_candidates`
+  entry (the next-ranked corpus beyond the primary policy count, e.g. Top-2 for a
+  `high` route). `answer_multi_corpus` keeps the full ranked + fallback set; when a
+  `high`-confidence Top-1 primary returns **empty** Evidence, it *expands* to include
+  the fallback candidate (Top-2) and retries retrieval **once** before abstaining —
+  §9.3 forbids hard-routing a miss straight to "no answer".
 - **Registry is the config source of truth** — the `CorpusConfig` handed to
   retrieval comes ONLY from `registry.get(corpus_id, ctx)` (for both routed and
-  explicit ids); the legacy single-corpus `_resolve_corpus` resolver is never used on
-  the multi-corpus path, so a stale/duplicate resolver config can never reach
-  retrieval.
+  explicit ids, including fallback candidates); the legacy single-corpus
+  `_resolve_corpus` resolver is never used on the multi-corpus path, so a
+  stale/duplicate resolver config can never reach retrieval.
 - Run multi-corpus retrieval, then **single-pass** synthesis
   (`build_multi_corpus_envelope` with the merged evidence; no judge, no iteration).
   `corpora_used` is set from `MultiCorpusResult.corpora_used`; `tool_calls` from
   `MultiCorpusResult.retrieval_calls`.
+- **Security / binding errors propagate in original type** — `answer_multi_corpus`
+  re-raises `CorpusNotDiscoverableError` / `ParentAuthorizationError` /
+  `EmptyAuthorizationScopeError` / `TenantBindingError` *before* any wrapping; only a
+  genuine `RetrievalBackendError` is rewrapped as `FastPathBackendError` (5xx). A
+  security denial is never relabelled as a backend fault.
 - **Partial-fault degrade + limitations** — if there is evidence AND at least one
   captured fault, the envelope is built from the available evidence but carries an
   explicit partial-retrieval `limitations` entry and is degraded from
   `complete`/`high` to `partial`/`medium` (never reported as unconditionally
   complete). If the merged evidence is empty and there are no faults →
   `conservative_refusal` (the existing abstain lock). If evidence is empty and
-  *every* corpus faulted → `retrieve` already raised (backend outage ≠ answer).
+  *every* corpus faulted → `retrieve` already raised. **If evidence is empty but a
+  partial fault exists** (one corpus down, sibling legitimately empty) → the service
+  raises (`FastPathBackendError`), it is **never** emitted as an ordinary
+  `no_evidence` abstain (P1-4).
 
 ---
 

@@ -20,6 +20,7 @@ from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
 from agentic_rag_enterprise.retrieval.fast_path import FastPathBackendError
+from agentic_rag_enterprise.retrieval.models import RetrievalBackendError
 from agentic_rag_enterprise.services.chat_service import ChatService
 from agentic_rag_enterprise.services.claims_schema import ClaimExtraction
 from tests.fixtures import FakeDenseEncoder, FakeSparseEncoder
@@ -119,7 +120,7 @@ class _FaultyRetriever:
         iteration: int = 0,
         plan_step_id: object = None,
     ) -> list[SnapshotEvidence]:
-        raise RuntimeError(f"backend down for {corpus.corpus_id}")
+        raise RetrievalBackendError(f"backend down for {corpus.corpus_id}")
 
 
 class _PartialFaultRetriever:
@@ -142,7 +143,7 @@ class _PartialFaultRetriever:
         plan_step_id: object = None,
     ) -> list[SnapshotEvidence]:
         if corpus.corpus_id in self._fault_for:
-            raise RuntimeError(f"backend down for {corpus.corpus_id}")
+            raise RetrievalBackendError(f"backend down for {corpus.corpus_id}")
         return list(self._ok.get(corpus.corpus_id, []))
 
 
@@ -314,3 +315,103 @@ def test_tool_calls_zero_when_no_corpus_discoverable() -> None:
     env = svc.answer_multi_corpus("q", _ctx(allowed_corpus_ids=["nonexistent"]))
     assert env.abstained
     assert env.tool_calls == 0
+
+
+# -- P1-1: §9.3 high-confidence Top-1 empty → expand to Top-2 (fallback) ----------
+
+
+def _routed_registry() -> InMemoryCorpusRegistry:
+    """Two discoverable corpora; a query matches ``product_docs`` strongly."""
+    return InMemoryCorpusRegistry(
+        [
+            _corpus("product_docs", authority_level=80).model_copy(
+                update={
+                    "name": "Product Documentation",
+                    "description": "product release notes",
+                    "capability_ids": ["vector_search"],
+                }
+            ),
+            _corpus("engineering_wiki", authority_level=70).model_copy(
+                update={
+                    "name": "Engineering Wiki",
+                    "description": "internal engineering notes",
+                    "capability_ids": ["vector_search"],
+                }
+            ),
+        ]
+    )
+
+
+def test_high_confidence_top1_empty_expands_to_top2() -> None:
+    # Query strongly matches product_docs (high confidence → Top-1). Its retriever
+    # returns nothing, so the service must expand to the §9.3 fallback candidate
+    # (engineering_wiki = Top-2) and retrieve from it — NOT immediately abstain.
+    retriever = _FakeRetriever(
+        {
+            "product_docs": [],  # high-confidence primary is empty
+            "engineering_wiki": [_evidence("ee", "eng fallback evidence", "engineering_wiki")],
+        }
+    )
+    svc = _service(retriever, _routed_registry())
+    env = svc.answer_multi_corpus("product release notes", _ctx())
+    # Both primary and fallback candidate were queried (one retrieval call each).
+    assert set(retriever.calls) == {"product_docs", "engineering_wiki"}
+    assert not env.abstained
+    assert env.corpora_used == ("engineering_wiki",)
+
+
+# -- P1-2: security / binding errors propagate in their original type -----------
+
+
+class _SecurityFaultRetriever:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def retrieve_evidence(
+        self,
+        ctx: SecurityContext,
+        query: str,
+        corpus: CorpusConfig,
+        top_k: object = None,
+        *,
+        dense_encoder: object,
+        sparse_encoder: object,
+        iteration: int = 0,
+        plan_step_id: object = None,
+    ) -> list[SnapshotEvidence]:
+        raise self._exc
+
+
+def test_security_error_propagates_from_chat_service() -> None:
+    from agentic_rag_enterprise.answer.envelope import TenantBindingError
+
+    # A cross-tenant snapshot is detected at the retrieval layer and raised as
+    # TenantBindingError. ChatService must propagate it unchanged — NOT rewrap it
+    # as FastPathBackendError.
+    rogue = _evidence("er", "t", corpus_id="engineering_wiki")
+    retriever = _FakeRetriever({"product_docs": [rogue]})
+    svc = _service(retriever, InMemoryCorpusRegistry())
+    try:
+        svc.answer_multi_corpus("q", _ctx(), corpus_ids=["product_docs"])
+        raise AssertionError("expected TenantBindingError to propagate")
+    except TenantBindingError:
+        pass
+
+
+# -- P1-4: partial fault with NO surviving evidence must raise, not abstain ------
+
+
+def test_partial_fault_with_no_evidence_raises_not_abstains() -> None:
+    # product_docs has a backend outage; engineering_wiki legitimately returns
+    # nothing. The merge is empty BUT a fault exists — this is a backend outage,
+    # not a benign "no answer", so it must surface as FastPathBackendError.
+    retriever = _PartialFaultRetriever(
+        fault_for={"product_docs"},
+        ok={"engineering_wiki": []},
+    )
+    svc = _service(retriever, InMemoryCorpusRegistry())
+    try:
+        svc.answer_multi_corpus("compare", _ctx(), corpus_ids=["product_docs", "engineering_wiki"])
+        raise AssertionError("expected FastPathBackendError for partial fault with no evidence")
+    except FastPathBackendError:
+        pass

@@ -117,5 +117,16 @@ class ParentVersionMismatchError(ParentAuthorizationError):
     code = "VERSION_MISMATCH"
 
 
+class RetrievalBackendError(Exception):
+    """An *explicit* backend / infrastructure fault during retrieval.
+
+    Only this type, raised by the per-corpus retrieval adapter boundary, is
+    captured as a :class:`~agentic_rag_enterprise.retrieval.multi_corpus.CorpusRetrievalFault`
+    in the multi-corpus path. Everything else (security / authorization / binding /
+    configuration errors and programming bugs) propagates immediately so it can
+    never be relabelled as a benign partial retrieval.
+    """
+
+
 class CorpusNotDiscoverableError(Exception):
     """Raised when a corpus fails the discoverability/tenant/enabled gate."""

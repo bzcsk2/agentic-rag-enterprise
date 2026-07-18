@@ -30,9 +30,11 @@ from agentic_rag_enterprise.answer.envelope import TenantBindingError
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
+from agentic_rag_enterprise.retrieval.backend_fault import wrap_backend_fault
 from agentic_rag_enterprise.retrieval.models import (
     CorpusNotDiscoverableError,
     ParentAuthorizationError,
+    RetrievalBackendError,
 )
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
 from agentic_rag_enterprise.security.filter import EmptyAuthorizationScopeError
@@ -86,9 +88,23 @@ class _MergeState:
     contributed: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class MergeResult:
+    """Output of :func:`merge_evidence` (P2-1: truthful source attribution).
+
+    ``contributing_corpora`` is the set of corpora that emitted at least one
+    *surviving* primary or folded Evidence. A corpus whose raw snapshots were all
+    dropped by Layer-1 stable-id dedup does NOT count — that distinguishes a
+    duplicate source from a real contributor.
+    """
+
+    evidence: tuple[SnapshotEvidence, ...]
+    contributing_corpora: tuple[str, ...]
+
+
 def merge_evidence(
     per_corpus: dict[str, list[SnapshotEvidence]],
-) -> tuple[SnapshotEvidence, ...]:
+) -> MergeResult:
     """Merge + dedup Evidence from several corpora in a deterministic order.
 
     Iterates corpora in ascending ``corpus_id`` order, evidence in input order.
@@ -107,13 +123,12 @@ def merge_evidence(
        attribution preserved) but only one primary Evidence is emitted. Same text
        under a *different* ``document_version`` is NOT folded (kept distinct).
 
-    Returns survivors ordered deterministically (corpus_id asc, then input order).
+    Returns a :class:`MergeResult` with survivors ordered deterministically
+    (corpus_id asc, then input order) and the set of contributing corpora.
     """
     state = _MergeState()
     for corpus_id in sorted(per_corpus):
         for ev in per_corpus[corpus_id]:
-            state.contributed.add(ev.corpus_id)
-
             # Layer 1: stable evidence_id dedup (first occurrence wins).
             if ev.evidence_id in state.id_keys:
                 continue
@@ -126,6 +141,7 @@ def merge_evidence(
                 state.survivors.append(ev)
                 state.id_keys[ev.evidence_id] = idx
                 state.text_keys[key] = idx
+                state.contributed.add(ev.corpus_id)
                 continue
 
             # Text collision under a different id: keep the higher authority
@@ -134,7 +150,11 @@ def merge_evidence(
             state.id_keys[ev.evidence_id] = existing_idx
             if ev.authority_level > state.survivors[existing_idx].authority_level:
                 state.survivors[existing_idx] = ev
-    return tuple(state.survivors)
+            state.contributed.add(ev.corpus_id)
+    return MergeResult(
+        evidence=tuple(state.survivors),
+        contributing_corpora=tuple(sorted(state.contributed)),
+    )
 
 
 class MultiCorpusRetrieval:
@@ -186,24 +206,30 @@ class MultiCorpusRetrieval:
         for corpus in corpora:
             calls += 1
             try:
-                evs = self._retriever.retrieve_evidence(
-                    ctx,
-                    query,
-                    corpus,
-                    top_k,
-                    dense_encoder=dense_encoder,
-                    sparse_encoder=sparse_encoder,
+                # The backend-fault boundary converts ONLY genuine infrastructure
+                # faults into ``RetrievalBackendError``. Security / authorization /
+                # binding / configuration errors and programming bugs propagate
+                # untouched and are never captured as a benign partial fault.
+                evs = wrap_backend_fault(
+                    lambda c=corpus: self._retriever.retrieve_evidence(
+                        ctx,
+                        query,
+                        c,
+                        top_k,
+                        dense_encoder=dense_encoder,
+                        sparse_encoder=sparse_encoder,
+                    )
                 )
             except _PROPAGATE_ERRORS:
                 # Security / binding / authorization / config error → fail closed.
                 # Never masked by a successful sibling corpus.
                 raise
-            except Exception as exc:  # noqa: BLE001 - only backend faults reach here
+            except RetrievalBackendError as exc:
                 faults.append(
                     CorpusRetrievalFault(
                         corpus_id=corpus.corpus_id,
                         reason=f"retrieval failed for corpus {corpus.corpus_id!r}",
-                        error_type=type(exc).__name__,
+                        error_type=type(exc.__cause__ or exc).__name__,
                     )
                 )
                 last_exc = exc
@@ -227,11 +253,13 @@ class MultiCorpusRetrieval:
 
         merged = merge_evidence(per_corpus)
         # corpora_used = every corpus that contributed (primary OR folded) evidence,
-        # so cross-corpus same-text folding preserves source attribution.
-        corpora_used = tuple(sorted(per_corpus))
+        # so cross-corpus same-text folding preserves source attribution and a
+        # corpus whose raw snapshots were all stable-id duplicates is not credited
+        # (P2-1).
+        corpora_used = merged.contributing_corpora
         routed = tuple(c.corpus_id for c in corpora)
         return MultiCorpusResult(
-            evidence=merged,
+            evidence=merged.evidence,
             corpora_used=corpora_used,
             routed=routed,
             faults=tuple(faults),

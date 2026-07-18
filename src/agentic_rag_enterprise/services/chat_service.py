@@ -53,6 +53,12 @@ from agentic_rag_enterprise.retrieval.fast_path import (
     FastPathSufficiency,
     run_fast_path,
 )
+from agentic_rag_enterprise.retrieval.models import (
+    CorpusNotDiscoverableError,
+    ParentAuthorizationError,
+    RetrievalBackendError,
+)
+from agentic_rag_enterprise.security.filter import EmptyAuthorizationScopeError
 from agentic_rag_enterprise.retrieval.retriever import SecureRetriever
 from agentic_rag_enterprise.retrieval.multi_corpus import (
     CorpusRetrievalFault,
@@ -173,7 +179,7 @@ class ChatService:
         ctx: SecurityContext,
         *,
         corpus_ids: list[str] | None = None,
-        router_limit: int = 2,
+        router_limit: int | None = None,
     ) -> AnswerEnvelope:
         """Answer one query across multiple (authorized) corpora — E-016 mode.
 
@@ -185,40 +191,53 @@ class ChatService:
 
         Selection:
         * When ``corpus_ids`` is given, the caller pins the corpora (each is still
-          resolved + discoverability-checked via ``resolve_corpus``; an
+          resolved + discoverability-checked via ``registry.get``; an
           undiscoverable corpus fails closed).
-        * When ``corpus_ids`` is ``None``, the router selects the top ``router_limit``
-          discoverable corpora from the registry.
+        * When ``corpus_ids`` is ``None``, the router applies the build-plan §9.3
+          policy (high→Top-1, medium→Top-2, low→Top-3) and may additionally expose
+          a ``fallback_candidate``. A ``high`` route whose primary returns no
+          Evidence is *expanded* to Top-2 (the fallback candidate) before any
+          abstain — §9.3 forbids hard-routing a miss straight to "no answer".
 
-        Fault semantics: a backend fault in one corpus is captured by the retrieval
-        layer and the other corpora's evidence is still merged; a *total* fault
-        raises (never becomes a refusal). Empty merged evidence with no fault
-        yields a conservative refusal (abstain lock).
+        Fault semantics:
+        * Security / authorization / binding / configuration errors propagate in
+          their original type (fail closed) — never relabelled as a backend fault.
+        * A backend fault in one corpus is captured by the retrieval layer and the
+          other corpora's evidence is still merged; a *total* fault raises (never
+          becomes a refusal). A *partial* fault with at least one surviving corpus
+          of evidence answers from that evidence (degraded, with an explicit
+          limitation). A partial fault where *no* corpus returned evidence raises —
+          it must never become an ordinary ``no_evidence`` abstain (P1-4).
+        * Empty merged evidence with no fault yields a conservative refusal
+          (abstain lock).
 
         Args:
             query: The user question.
             ctx: The runtime-injected security context (shared across all corpora).
             corpus_ids: Optional explicit corpus selection. ``None`` → router picks.
-            router_limit: Max corpora the router may select when ``corpus_ids`` is
-                ``None`` (default 2).
+            router_limit: Optional hard cap on router candidates (never widens the
+                §9.3 policy). ``None`` lets the policy decide Top-1/2/3.
         """
         # 1) Select the corpora to query (router or explicit), all discoverable.
         #    The Registry is the single source of truth for the CorpusConfig that
         #    enters retrieval (P1-2): we use exactly the authorized config
-        #    ``registry.get`` returns — never a separate ``resolve_corpus`` result
-        #    that could carry a stale/divergent collection, tenant, ACL or authority.
+        #    ``registry.get`` returns — never a separate resolver result that could
+        #    carry a stale/divergent collection, tenant, ACL or authority.
         if self._registry is None:
             raise ChatServiceError("multi-corpus mode requires a CorpusRegistry on the ChatService")
         if corpus_ids is not None:
             # registry.get fails closed for unknown / non-discoverable ids.
             selected = [self._registry.get(cid, ctx) for cid in corpus_ids]
+            fallback: list[CorpusConfig] = []
         else:
             route = self._router.route(query, ctx, self._registry, limit=router_limit)
             # Re-fetch each routed candidate's authorized config from the registry
             # so the data-plane config matches the control-plane approval exactly.
             selected = [self._registry.get(c.corpus_id, ctx) for c in route.candidates]
+            # The router's §9.3 fallback candidate (e.g. Top-2 for a high route).
+            fallback = [self._registry.get(c.corpus_id, ctx) for c in route.fallback_candidates]
 
-        if not selected:
+        if not selected and not fallback:
             # Nothing discoverable to query → abstain (no evidence, fail-closed).
             # Zero corpora were queried, so tool_calls is 0 (P2-2).
             return build_multi_corpus_envelope(
@@ -233,41 +252,17 @@ class ChatService:
                 stop_reason="no_evidence",
             )
 
-        # 2) Cross-corpus retrieval + merge/dedup (raises on total fault).
-        try:
-            result = self._multi.retrieve(
-                ctx,
-                query,
-                selected,
-                top_k=self._top_k,
-                dense_encoder=self._dense_encoder,
-                sparse_encoder=self._sparse_encoder,
-            )
-        except Exception as exc:  # noqa: BLE001 - total retrieval outage surfaces as 5xx
-            raise FastPathBackendError(f"multi-corpus retrieval failed: {exc}") from exc
+        # 2) Cross-corpus retrieval + merge/dedup (raises on total fault or on a
+        #    partial fault that left no evidence — never an ordinary abstain).
+        result = self._retrieve_or_expand(query, ctx, selected, fallback)
 
         # Partial-fault (P1-4.3, frozen semantics = degrade + explicit limitation):
-        # a routed corpus backend faulted but a sibling returned evidence. We may
-        # answer from the available evidence, but the envelope must carry an
-        # explicit partial-retrieval limitation and must not be reported as
+        # a routed corpus backend faulted but at least one sibling returned
+        # evidence. We answer from the available evidence, but the envelope must
+        # carry an explicit partial-retrieval limitation and must not be reported as
         # unconditionally complete/high.
         partial_retrieval = bool(result.faults)
         limitations = _partial_retrieval_limitations(result.faults)
-
-        if not result.evidence:
-            # No evidence and no fault → conservative refusal (abstain lock).
-            # (A total fault would already have raised inside ``retrieve``.)
-            return build_multi_corpus_envelope(
-                ctx,
-                query=query,
-                evidence=(),
-                corpora_used=result.corpora_used,
-                answer_markdown="",
-                claims=[],
-                coverage=None,
-                tool_calls=result.retrieval_calls,
-                stop_reason="no_evidence",
-            )
 
         # 3) Single-pass synthesis from the merged, verified claims.
         return self._synthesize_multi_corpus(
@@ -277,6 +272,79 @@ class ChatService:
             partial_retrieval=partial_retrieval,
             limitations=limitations,
         )
+
+    def _retrieve_or_expand(
+        self,
+        query: str,
+        ctx: SecurityContext,
+        selected: list[CorpusConfig],
+        fallback: list[CorpusConfig],
+    ) -> MultiCorpusResult:
+        """Retrieve across ``selected``; on a high-confidence empty primary, expand.
+
+        Passes security / authorization / binding errors through unchanged (P1-2):
+        only a genuine ``RetrievalBackendError`` from the retrieval layer is wrapped
+        as a ``FastPathBackendError`` (total outage → 5xx). A partial backend fault
+        that leaves no surviving evidence raises — it is never relabelled as a plain
+        ``no_evidence`` abstain (P1-4).
+        """
+        try:
+            result = self._multi.retrieve(
+                ctx,
+                query,
+                selected,
+                top_k=self._top_k,
+                dense_encoder=self._dense_encoder,
+                sparse_encoder=self._sparse_encoder,
+            )
+        except (
+            CorpusNotDiscoverableError,
+            ParentAuthorizationError,
+            EmptyAuthorizationScopeError,
+            TenantBindingError,
+        ):
+            # Security / binding / authorization error — propagate in its original
+            # type (fail closed); never masked by a healthy sibling corpus.
+            raise
+        except RetrievalBackendError as exc:
+            raise FastPathBackendError(f"multi-corpus retrieval failed: {exc}") from exc
+
+        if not result.evidence:
+            # Primary returned nothing. If this was a high-confidence Top-1 route,
+            # the router supplied a §9.3 fallback candidate (Top-2) — expand and
+            # retry once before giving up (P1-1).
+            if fallback and set(c.corpus_id for c in fallback) - set(result.routed):
+                expanded = list(selected) + [
+                    c for c in fallback if c.corpus_id not in result.routed
+                ]
+                try:
+                    result = self._multi.retrieve(
+                        ctx,
+                        query,
+                        expanded,
+                        top_k=self._top_k,
+                        dense_encoder=self._dense_encoder,
+                        sparse_encoder=self._sparse_encoder,
+                    )
+                except (
+                    CorpusNotDiscoverableError,
+                    ParentAuthorizationError,
+                    EmptyAuthorizationScopeError,
+                    TenantBindingError,
+                ):
+                    raise
+                except RetrievalBackendError as exc:
+                    raise FastPathBackendError(f"multi-corpus retrieval failed: {exc}") from exc
+
+        if not result.evidence and result.faults:
+            # Partial fault with no surviving evidence: this is a backend outage,
+            # not a benign "no answer". Raise rather than abstain (P1-4). A total
+            # fault would already have raised inside ``retrieve``.
+            raise FastPathBackendError(
+                f"multi-corpus retrieval partially failed with no evidence: "
+                f"{[f.corpus_id for f in result.faults]}"
+            )
+        return result
 
     def _synthesize_multi_corpus(
         self,
