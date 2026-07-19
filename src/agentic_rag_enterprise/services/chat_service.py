@@ -67,6 +67,7 @@ from agentic_rag_enterprise.retrieval.fast_path import (
 )
 from agentic_rag_enterprise.storage.checkpoint_store import (
     CHECKPOINT_ABORTED,
+    CHECKPOINT_COMPLETED,
     RunCheckpoint,
     ResumeAuthError,
     reauthorize_evidence,
@@ -918,6 +919,17 @@ class ChatService:
         if not kept_evidence:
             # Temporal filter dropped every surviving evidence (all expired /
             # not-yet-effective / outside the window). Refuse without the model (P1-1).
+            # Sync the terminal state so a persisted checkpoint can be resumed
+            # idempotently without re-entering the loop (P1-3 residual).
+            state.final_evidence = ()
+            state.final_report = report
+            state.coverage = SufficiencyResult(
+                overall_status="insufficient",
+                should_abstain=True,
+                fact_coverage=(),
+            )
+            state.final_reason = "no_evidence"
+            state.conflict_stop = False
             return build_no_evidence_refusal(
                 ctx,
                 corpora_used=(corpus.corpus_id,),
@@ -948,14 +960,20 @@ class ChatService:
         except (JudgeTimeoutError, JudgeError) as exc:
             # Judge fault: degrade conservatively (abstain), never fabricate.
             logger.warning("coverage judge failed; degrading conservatively: %s", exc)
+            cov = SufficiencyResult(
+                overall_status="insufficient",
+                should_abstain=True,
+                fact_coverage=(),
+            )
+            state.coverage = cov
+            state.final_evidence = kept_evidence
+            state.final_report = report
+            state.final_reason = "judge_fault"
+            state.conflict_stop = False
             return conservative_refusal(
                 first_result,
                 ctx,
-                coverage=SufficiencyResult(
-                    overall_status="insufficient",
-                    should_abstain=True,
-                    fact_coverage=(),
-                ),
+                coverage=cov,
                 gap_rounds=state.gap_rounds,
                 iterations=state.gap_rounds,
                 tool_calls=state.retrieval_calls,
@@ -1147,6 +1165,33 @@ class ChatService:
                 dropped.append((ev, reason))
         if not surviving:
             # No authorized evidence remains → refuse without invoking the model.
+            # Save a terminal state and mark completed so resume is idempotent and
+            # never re-enters the loop (P1-3 residual: completed no-evidence
+            # checkpoint would otherwise assert state.coverage is not None on
+            # round_idx > 0).
+            if self._metadata_store is not None:
+                state = self._build_state_from_checkpoint(ck, [])
+                state.final_evidence = ()
+                state.final_report = None
+                state.coverage = SufficiencyResult(
+                    overall_status="insufficient",
+                    should_abstain=True,
+                    fact_coverage=(),
+                )
+                state.final_reason = "all_evidence_revoked"
+                state.conflict_stop = False
+                self._save_checkpoint(
+                    run_id,
+                    ctx,
+                    state,
+                    first_result=ck.first_result,
+                    required=ck.required_facts,
+                    max_rounds=ck.max_rounds,
+                    query=ck.query,
+                    corpus_id=ck.corpus_id,
+                    round_index=ck.round_index,
+                )
+                self._metadata_store.mark_run_checkpoint_done(run_id)
             return build_no_evidence_refusal(ctx, corpora_used=(ck.corpus_id,))
 
         corpus = self._resolve_corpus(ck.corpus_id)
@@ -1167,9 +1212,47 @@ class ChatService:
         # name the revoked source. The recomputed verdict then decides whether to
         # stop or to continue retrieving.
         if dropped:
+            # A completed checkpoint whose evidence was revoked must be marked
+            # "running" before recompute so the status reflects active processing
+            # (P1-3 residual). The terminal save at loop/end flips it back to
+            # completed.
+            if ck.status == CHECKPOINT_COMPLETED and self._metadata_store is not None:
+                self._save_checkpoint(
+                    run_id,
+                    ctx,
+                    state,
+                    first_result=ck.first_result,
+                    required=ck.required_facts,
+                    max_rounds=ck.max_rounds,
+                    query=ck.query,
+                    corpus_id=ck.corpus_id,
+                    round_index=ck.round_index,
+                )
             report, kept_evidence = self._run_conflict_stage(ck.query, tuple(surviving))
             if not kept_evidence:
                 # Temporal filter dropped every surviving evidence → refuse.
+                # Persist terminal state and mark completed (P1-3 residual).
+                state.final_evidence = ()
+                state.final_report = report
+                state.coverage = SufficiencyResult(
+                    overall_status="insufficient",
+                    should_abstain=True,
+                    fact_coverage=(),
+                )
+                state.final_reason = "temporal_no_evidence"
+                state.conflict_stop = False
+                self._save_checkpoint(
+                    run_id,
+                    ctx,
+                    state,
+                    first_result=ck.first_result,
+                    required=ck.required_facts,
+                    max_rounds=ck.max_rounds,
+                    query=ck.query,
+                    corpus_id=ck.corpus_id,
+                    round_index=ck.round_index,
+                )
+                self._metadata_store.mark_run_checkpoint_done(run_id)
                 return build_no_evidence_refusal(
                     ctx,
                     corpora_used=(ck.corpus_id,),
@@ -1194,13 +1277,11 @@ class ChatService:
                 self._metadata_store.mark_run_checkpoint_done(run_id)
                 return self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
             # Otherwise: insufficient → continue iterating from ck.round_index.
-        elif ck.coverage is not None and ck.coverage.overall_status in (
-            "sufficient",
-            "contradicted",
-        ):
-            # No evidence revoked and already terminal → idempotent finalize so the
-            # resumed envelope is byte-for-byte identical to the uninterrupted run
-            # (invariant 4). The original stop_reason is preserved.
+        elif ck.status == CHECKPOINT_COMPLETED and not dropped:
+            # No evidence revoked and the checkpoint was already completed →
+            # idempotent finalize (invariant 4). Uses stored state so ANY terminal
+            # outcome (sufficient, contradicted, no-evidence, judge-fault) is
+            # returned identically — not just sufficient/contradicted (P1-3 residual).
             self._metadata_store.mark_run_checkpoint_done(run_id)
             return self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
 

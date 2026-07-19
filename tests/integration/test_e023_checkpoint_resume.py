@@ -36,9 +36,14 @@ from agentic_rag_enterprise.domain.security import SecurityContext
 from agentic_rag_enterprise.judge.deterministic_coverage_judge import (
     DeterministicCoverageJudge,
 )
-from agentic_rag_enterprise.judge.models import RequiredFact
+from agentic_rag_enterprise.judge.models import RequiredFact, SufficiencyResult
 from agentic_rag_enterprise.judge.query_fact_extractor import make_required_fact
-from agentic_rag_enterprise.retrieval.fast_path import FastPathBackendError
+from agentic_rag_enterprise.retrieval.fast_path import (
+    FastPathBackendError,
+    FastPathResult,
+    FastPathStopReason,
+    FastPathSufficiency,
+)
 from agentic_rag_enterprise.retrieval.models import CorpusNotDiscoverableError
 from agentic_rag_enterprise.security.policy import ResourceAcl
 from agentic_rag_enterprise.services.chat_service import ChatService
@@ -49,6 +54,7 @@ from agentic_rag_enterprise.services.container import (
     reset_default_container,
 )
 from agentic_rag_enterprise.storage.checkpoint_store import (
+    CHECKPOINT_COMPLETED,
     CHECKPOINT_RUNNING,
     CheckpointIdentityConflict,
     RunCheckpoint,
@@ -680,3 +686,196 @@ def test_run_id_same_identity_updates_state_without_conflict() -> None:
     assert ck is not None
     assert ck.round_index == 2
     assert ck.status == CHECKPOINT_RUNNING
+
+
+# --------------------------------------------------------------------------- #
+# P1-3 residual 测试：completed 终止状态机必须统一支持 idempotent resume
+# --------------------------------------------------------------------------- #
+def _build_refusal_checkpoint(
+    run_id: str,
+    *,
+    status: str = CHECKPOINT_COMPLETED,
+    evidence: tuple | None = None,
+    round_index: int = 1,
+    coverage: object = None,
+) -> "RunCheckpoint":
+    from agentic_rag_enterprise.judge.models import SufficiencyResult
+
+    if coverage is None:
+        coverage = SufficiencyResult(
+            overall_status="insufficient",
+            should_abstain=True,
+            fact_coverage=(),
+        )
+    evs = evidence or ()
+    return RunCheckpoint(
+        run_id=run_id,
+        tenant_id="t1",
+        user_id="u1",
+        session_id="s1",
+        policy_version="1.0",
+        query="q",
+        corpus_id="eng",
+        max_rounds=5,
+        required_facts=_facts("vacation policy"),
+        round_index=round_index,
+        evidence=evs,
+        prior_queries=["q"],
+        seen_text_hashes=[ev.text_hash for ev in evs],
+        seen_doc_versions=[(ev.document_id, ev.document_version) for ev in evs],
+        retrieval_calls=1,
+        gap_rounds=1,
+        final_reason="no_evidence",
+        conflict_stop=False,
+        coverage=coverage,
+        final_report=None,
+        final_evidence_ids=[],
+        first_result=None,
+    )
+
+
+def test_completed_no_evidence_checkpoint_resumes_idempotently() -> None:
+    """A 'completed' checkpoint whose terminal outcome was no-evidence must
+    resume idempotently (no AssertionError, no re-entering the loop)."""
+    container = get_default_container()
+    _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
+    mstore = container.metadata_store
+    svc = _service(container, _FakeRetriever({"q": []}))
+    ck = _build_refusal_checkpoint("NE1", evidence=(_evidence("e1", "text", "d1"),))
+    # first_result must be set for a resumable checkpoint.
+    ck = ck.model_copy(
+        update={
+            "first_result": FastPathResult(
+                query="q",
+                corpus_id="eng",
+                tenant_id="t1",
+                evidence=(_evidence("e1", "text", "d1"),),
+                sufficiency=FastPathSufficiency.SUFFICIENT,
+                stop_reason=FastPathStopReason.EVIDENCE_FOUND,
+            ),
+        }
+    )
+    mstore.save_run_checkpoint(ck)
+
+    resumed = svc.resume_run("NE1", _ctx())
+    assert resumed.abstained is True
+    assert resumed.completeness == "insufficient"
+    # Verify the checkpoint is still 'completed' (not corrupted by resume).
+    row = mstore._conn.execute(
+        "SELECT status FROM run_checkpoints WHERE run_id=?", ("NE1",)
+    ).fetchone()
+    assert row["status"] == "completed"
+
+    # A second resume must return the same result (idempotent).
+    resumed2 = svc.resume_run("NE1", _ctx())
+    assert resumed2.abstained == resumed.abstained
+    assert resumed2.completeness == resumed.completeness
+
+
+def test_completed_judge_fault_checkpoint_resumes_idempotently() -> None:
+    """A 'completed' checkpoint that ended via judge fault must resume
+    idempotently (no re-calling the Judge, no AssertionError)."""
+    container = get_default_container()
+    _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
+    mstore = container.metadata_store
+    svc = _service(container, _FakeRetriever({"q": []}))
+    cov = SufficiencyResult(
+        overall_status="insufficient",
+        should_abstain=True,
+        fact_coverage=(),
+    )
+    ck = _build_refusal_checkpoint(
+        "JF1",
+        evidence=(_evidence("e1", "text", "d1"),),
+        coverage=cov,
+    )
+    ck = ck.model_copy(
+        update={
+            "final_reason": "judge_fault",
+            "first_result": FastPathResult(
+                query="q",
+                corpus_id="eng",
+                tenant_id="t1",
+                evidence=(_evidence("e1", "text", "d1"),),
+                sufficiency=FastPathSufficiency.SUFFICIENT,
+                stop_reason=FastPathStopReason.EVIDENCE_FOUND,
+            ),
+        }
+    )
+    mstore.save_run_checkpoint(ck)
+
+    resumed = svc.resume_run("JF1", _ctx())
+    assert resumed.abstained is True
+    assert resumed.completeness == "insufficient"
+    row = mstore._conn.execute(
+        "SELECT status FROM run_checkpoints WHERE run_id=?", ("JF1",)
+    ).fetchone()
+    assert row["status"] == "completed"
+
+
+def test_running_checkpoint_revoke_all_evidence_marks_completed() -> None:
+    """A 'running' checkpoint whose ALL evidence is revoked on resume must
+    return a no-evidence refusal AND persist status='completed'."""
+    container = get_default_container()
+    _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
+    mstore = container.metadata_store
+
+    # Save a RUNNING (incomplete) checkpoint with one evidence.
+    svc = _service(container, _FakeRetriever({"q": []}))
+    ev = _evidence("e1", "The vacation policy grants 20 days paid leave.", "d1")
+    ck = RunCheckpoint(
+        run_id="REVOKE-ALL",
+        tenant_id="t1",
+        user_id="u1",
+        session_id="s1",
+        policy_version="1.0",
+        query="q",
+        corpus_id="eng",
+        max_rounds=5,
+        required_facts=_facts("vacation policy"),
+        round_index=1,
+        evidence=(ev,),
+        prior_queries=["q"],
+        seen_text_hashes=[ev.text_hash],
+        seen_doc_versions=[(ev.document_id, ev.document_version)],
+        retrieval_calls=1,
+        gap_rounds=1,
+        final_reason=None,
+        conflict_stop=False,
+        coverage=None,
+        final_report=None,
+        final_evidence_ids=[],
+        first_result=FastPathResult(
+            query="q",
+            corpus_id="eng",
+            tenant_id="t1",
+            evidence=(ev,),
+            sufficiency=FastPathSufficiency.SUFFICIENT,
+            stop_reason=FastPathStopReason.EVIDENCE_FOUND,
+        ),
+    )
+    mstore.save_run_checkpoint(ck)
+    assert mstore.load_run_checkpoint("REVOKE-ALL").status == "running"
+
+    # Tighten d1's ACL so u1 can no longer read it → all evidence revoked.
+    mstore.update_document_acl(
+        "t1",
+        "eng",
+        "d1",
+        "v1",
+        security_level="public",
+        acl_scope="restricted",
+        allowed_user_ids=["other"],
+        allowed_group_ids=[],
+        denied_user_ids=[],
+        denied_group_ids=[],
+    )
+
+    resumed = svc.resume_run("REVOKE-ALL", _ctx())
+    assert resumed.abstained is True
+
+    # The checkpoint must now be 'completed' (not left as 'running').
+    row = mstore._conn.execute(
+        "SELECT status FROM run_checkpoints WHERE run_id=?", ("REVOKE-ALL",)
+    ).fetchone()
+    assert row["status"] == "completed"
