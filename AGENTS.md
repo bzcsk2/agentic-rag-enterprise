@@ -177,12 +177,14 @@
   at `4d072bd`** ("E-018: real RetrieverTool two-hop + full regression pass") on top of the
   amended `docs/issue-e018-contract.md` (`5d02d99` / `2027102`). Full Planner/DAG contract
   at `docs/issue-e017-contract.md`; Executor contract at `docs/issue-e018-contract.md`.
-- **M6 / E-021** — Temporal scope, source authority & conflict — **contract frozen /
-  implementation pending** (this commit). Adds `TemporalScope`, a deterministic temporal
-  parser + filter, a `ConflictResolver` (five conflict types, four explicit auto-resolution
-  rules; unresolvable → `contradicted`), and the minimal `AnswerEnvelope.conflict_report`
-  extension, integrated into the post-retrieval evidence pipeline without changing the
-  Planner core. Full contract at `docs/issue-e021-contract.md`.
+- **M6 / E-021** — Temporal scope, source authority & conflict — **contract frozen / amended,
+  implementation pending** (this commit amends the `30c1d2e` freeze with three main-path
+  fixes: `as_of`-vs-`range` precedence, `ConflictReport` no longer carries `OverallStatus`,
+  conflict detection requires a structured `assertion` parser). Adds `TemporalScope`, a
+  deterministic temporal parser + filter, a `ConflictResolver` (five conflict types, four
+  explicit auto-resolution rules; unresolvable → `CONTRADICTED`), and the minimal
+  `AnswerEnvelope.conflict_report` extension, integrated into the post-retrieval evidence
+  pipeline without changing the Planner core. Full contract at `docs/issue-e021-contract.md`.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
@@ -710,14 +712,23 @@ Controlled Executor + dependent multi-hop (build plan §13.4). Full contract at
   Executor injects `SecurityContext`); no write operation (`sql`/`api`/`graph`); no dynamic
   step creation; no change to E-011→E-016 behaviour.
 
-## E-021 Allowed Changes (M6 only) — contract frozen / implementation pending
+## E-021 Allowed Changes (M6 only) — contract frozen / amended, implementation pending
 Temporal scope, source authority & conflict (build plan §15 / Milestone 6). Full contract at
 `docs/issue-e021-contract.md`.
 - `docs/issue-e021-contract.md`, `AGENTS.md`.
-- **This commit is contract-only**: it freezes `TemporalScope`, the deterministic temporal
-  parser + filter, the `ConflictResolver` (five conflict types, four explicit auto-resolution
-  rules), the `ConflictReport` model, and the minimal `AnswerEnvelope.conflict_report`
-  extension. Implementation opens **after** acceptance.
+- **This commit is contract-only (amendment)**: it amends the `30c1d2e` freeze to fix three
+  main-path-breaking defects — (1) `as_of` vs `range` parser precedence (explicit range →
+  `as_of` → `current` → bare-year range → `unspecified`; bare-year rule suppressed when an
+  `as_of` marker is present); (2) `ConflictReport` no longer carries `OverallStatus` — it emits
+  a resolver-only `ConflictStatus` (`NONE` / `RESOLVED` / `CONTRADICTED`), and only
+  `CONTRADICTED` forces `SufficiencyResult.overall_status = "contradicted"` (NONE / RESOLVED
+  leave the judge untouched, preserving M2–M5 behavior); (3) conflict detection now requires a
+  structured `assertion` parser (version / boolean / quantity / key:value) — differing full
+  text alone NEVER creates a candidate, so normal complementary multi-evidence answers are not
+  mis-flagged. `TemporalScope`, the deterministic temporal parser + filter, the
+  `ConflictResolver` (five conflict types, four explicit auto-resolution rules), the
+  `ConflictReport` model, and the minimal `AnswerEnvelope.conflict_report` extension are all
+  frozen. Implementation opens **after** acceptance.
 - **Reuse, no change:** `domain/evidence.py` (`Evidence` snapshot — all resolver fields already
   present), `retrieval/retriever.py` (`SecureRetriever.retrieve_evidence` — authorized
   collection only), `judge/models.py` (`SufficiencyResult`, `OverallStatus`, `FactCoverage`),

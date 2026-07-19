@@ -1,7 +1,10 @@
 # Issue E-021 — Temporal scope, source authority & conflict handling
 
 **Milestone:** M6 — Temporal scope, source authority & conflict (`E-021`)
-**Status:** contract frozen / implementation pending — acceptance of this doc unlocks
+**Status:** contract frozen / implementation pending — **amended at this commit to fix three
+main-path-breaking defects** (see §2a `as_of`-vs-`range` precedence, §4 `ConflictReport`
+no longer carries `OverallStatus`, §4/§5 conflict detection now requires a structured
+`assertion` parser). Acceptance of this (amended) doc unlocks
 `domain/temporal.py`, `evidence/temporal.py`, `evidence/conflict_resolver.py`,
 `evidence/models.py`, the `AnswerEnvelope.conflict_report` extension, and the test paths.
 **Baseline:** `6356dc7` (main HEAD; includes M5 / E-018 CLOSED / ACCEPTED at `4d072bd`).
@@ -31,8 +34,11 @@ Reuses `domain/evidence.Evidence` fields — **no new `Evidence` field is introd
 - **No change to `QueryPlan`, `PlanStep`, or the Executor protocol** (M5 frozen). The
   resolver runs in the evidence pipeline *after* retrieval, never inside the Planner / DAG.
 - **No LLM time-reasoning chain, no value-extraction model, no NER.** Conflict detection is
-  deterministic (topic-key grouping + normalized-text comparison). Richer conflict extraction
-  is a later-milestone capability.
+  deterministic and conservative: candidate conflicts are created **only** under strict
+  conditions (same-`document_id` version divergence, or a structured `assertion` parser
+  extracting a *different* value on the *same* key with overlapping effective time). Differing
+  full `text` alone **never** constitutes a conflict. Richer conflict extraction is a
+  later-milestone capability.
 - **No new `Evidence` field.** Everything the resolver needs already exists:
   `authority_level`, `effective_from`, `effective_to`, `deprecated`, `document_version`,
   `retrieved_at`, `rerank_score`, `retrieval_score`, `source_uri`, `source_filename`,
@@ -53,9 +59,10 @@ Reuses `domain/evidence.Evidence` fields — **no new `Evidence` field is introd
 3. Resolution **never** selects a "most likely" answer by `retrieval_score` /
    `rerank_score`. Only the four explicit rules (version / time / authority / historical)
    may resolve a conflict; vector relevance is *not* a tie-breaker for truth.
-4. When a conflict cannot be resolved, the system returns `contradicted` and lists the
-   conflicting sources + applicable times. It does **not** emit a single deterministic
-   conclusion.
+4. When a conflict cannot be auto-resolved, the resolver emits `CONTRADICTED`; the pipeline
+   then forces `SufficiencyResult.overall_status = "contradicted"` and lists the conflicting
+   sources + applicable times. It does **not** emit a single deterministic conclusion from
+   the resolver.
 
 ---
 
@@ -100,15 +107,22 @@ following representative inputs define the MVP mapping (build plan §15.4):
 | "2024 年发生了什么" / "between 2024-01-01 and 2024-12-31" / "2024-01-01 ~ 2024-12-31" | `range` (start/end inferred) |
 | (no temporal marker) | `unspecified` |
 
-Frozen mode-selection priority (first match wins):
+Frozen mode-selection priority (first match wins — fixes the `as_of`-vs-`range` clash where
+"截至 2025-12-31" could otherwise grab the bare `2025` as a year `range`):
 
-1. **range** — explicit range markers (`between … and …`, `from … to …`, `… 至 …`, `… 到 …`,
-   `… 之间`, `… ~ …`, a bare 4-digit year token, or a `*年*` Chinese year reference). A bare
-   year `YYYY` is expanded to `start=YYYY-01-01`, `end=YYYY-12-31`; a bare `YYYY-MM-DD` to
-   that day's `[00:00, 23:59:59]`; an explicit `start … end` pair uses the parsed bounds.
-2. **as_of** — `截至` / `as of` / `as_of` / `截止` / `… 为止` followed by a parseable date.
+1. **explicit range** — explicit range markers (`between … and …`, `from … to …`, `… 至 …`,
+   `… 到 …`, `… 之间`, `… ~ …`). An explicit `start … end` pair uses the parsed bounds.
+2. **as_of** — `截至` / `as of` / `as_of` / `截止` / `… 为止` followed by a parseable date
+   → `as_of` with that date. **Guard (frozen):** when any `as_of` marker
+   (`截至` / `as of` / `as_of` / `截止` / `… 为止`) is present, the bare-year rule below MUST
+   NOT run — the query is `as_of`, never a year `range`. (This is what keeps
+   "截至 2025-12-31" → `as_of`, not a `2025` range.)
 3. **current** — `当前` / `现在` / `目前` / `current` / `now` / `today`.
-4. **unspecified** — no temporal marker at all (fallback; treated like `current` for the
+4. **bare-year range** — a bare 4-digit year token or a `*年*` Chinese year reference
+   *without* any of the markers above (e.g. "2024 年发生了什么"). A bare year `YYYY` is
+   expanded to `start=YYYY-01-01`, `end=YYYY-12-31`; a bare `YYYY-MM-DD` to that day's
+   `[00:00, 23:59:59]`.
+5. **unspecified** — no temporal marker at all (fallback; treated like `current` for the
    filter but recorded distinctly so downstream can tell "user said nothing about time").
 
 Date formats (whitelist, frozen): `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `YYYY/MM/DD`,
@@ -174,11 +188,18 @@ from pydantic import BaseModel, ConfigDict
 
 
 class ConflictType(str, Enum):
-    VALUE_CONFLICT = "value_conflict"      # same topic, different asserted value
+    VALUE_CONFLICT = "value_conflict"      # same topic+key, different asserted value
     VERSION_CONFLICT = "version_conflict"  # same document_id, different document_version
     TIME_CONFLICT = "time_conflict"        # same topic, different effective windows
-    SCOPE_CONFLICT = "scope_conflict"      # different subject/scope, not a real contradiction
+    SCOPE_CONFLICT = "scope_conflict"      # different key/subject, complementary not contradictory
     POLICY_CONFLICT = "policy_conflict"    # contradicts a formal policy / authoritative doc
+
+
+class ConflictStatus(str, Enum):
+    """Resolver-only verdict — the resolver cannot judge sufficiency (issue #2)."""
+    NONE = "none"                 # no candidate conflict at all
+    RESOLVED = "resolved"         # every candidate auto-resolved (version/time/authority/scope)
+    CONTRADICTED = "contradicted"  # >=1 candidate could not be resolved
 
 
 class ConflictResolution(str, Enum):
@@ -186,7 +207,16 @@ class ConflictResolution(str, Enum):
     AUTO_TIME = "auto_resolved_time"              # rule 2
     AUTO_AUTHORITY = "auto_resolved_authority"    # rule 3
     AUTO_SCOPE = "auto_resolved_scope"            # rule (scope: keep both, distinct)
-    UNRESOLVED = "unresolved"                     # → contradicted
+    UNRESOLVED = "unresolved"                     # → CONTRADICTED
+
+
+class AssertionExtraction(BaseModel):
+    """Deterministic structured value extracted from one Evidence (issue #3)."""
+    model_config = ConfigDict(frozen=True)
+    is_structured: bool
+    value: str | None = None                                  # normalized, e.g. "v2", "true", "60s"
+    value_kind: Literal["version", "boolean", "quantity", "key_value"] | None = None
+    key: str | None = None                                    # for key_value: the LHS key
 
 
 class SourceRef(BaseModel):
@@ -220,17 +250,31 @@ class ConflictFinding(BaseModel):
 class ConflictReport(BaseModel):
     model_config = ConfigDict(frozen=True)
     scope: TemporalScope
-    overall_status: OverallStatus        # reuses judge.models.OverallStatus; may be "contradicted"
+    conflict_status: ConflictStatus      # resolver-only: none / resolved / contradicted
     findings: tuple[ConflictFinding, ...]
     resolved_evidence_ids: tuple[str, ...]   # evidence to feed downstream synthesis
     contradicted_fact_ids: tuple[str, ...] = ()
 ```
 
 `topic_key` is **deterministic**: for the MVP it is the normalized query (whitespace-
-collapsed, lower-cased, punctuation-stripped) supplied by the caller. Two `Evidence` under
-the same `topic_key` with *differing normalized `text`* are treated as asserting different
-values → a candidate conflict. This crude-but-deterministic heuristic is explicitly the MVP
-boundary (no value NER, no LLM).
+collapsed, lower-cased, punctuation-stripped) supplied by the caller. `extract_assertion(text)
+-> AssertionExtraction` is a **deterministic regex-only** parser (no LLM, no NER) supporting
+only explicit forms:
+
+* **version** — `(?:v|version|版本)\s*[:=]?\s*(\d+(?:\.\d+)*)`;
+* **boolean** — `enabled|disabled|true|false|开启|关闭|启用|停用|是|否`;
+* **quantity** — `(\d+(?:\.\d+)?)\s*(s|ms|seconds|minutes|分钟|秒|小时|mb|gb|kb|%|个|条)`;
+* **key_value** — `([A-Za-z_一-龥]+)\s*[:：]\s*(\S+)`.
+
+If none match → `is_structured=False`. **A candidate conflict is created only when:**
+(1) same `document_id` with different `document_version` (`VERSION_CONFLICT`), **or**
+(2) same `topic_key`, effective windows overlap, structured assertions extracted from ≥2
+evidence, **and** the values differ — same `key` (or keyless) → `VALUE_CONFLICT`; different
+`key`s (clearly distinct subjects, e.g. `timeout: 30s` vs `retries: 5`) → `SCOPE_CONFLICT`.
+**Differing full `text` alone NEVER creates a candidate** — when no structured assertion can
+be extracted (any involved evidence has `is_structured=False`), the pair is **pass-through**,
+not a conflict. This is what prevents normal multi-evidence answers (an API-version note plus
+a migration-step note) from being mis-flagged.
 
 ---
 
@@ -239,8 +283,20 @@ boundary (no value NER, no LLM).
 `evidence/conflict_resolver.py`: `ConflictResolver.resolve(evidence, scope, *, topic_key,
 now=None) -> ConflictReport`.
 
-For each `topic_key` group, compare the surviving (post-temporal-filter) evidence. Apply the
-**four explicit auto-resolution rules** from build plan §15.3 in this precedence:
+For each `topic_key` group, examine the surviving (post-temporal-filter) evidence. **Candidate
+conflicts are created ONLY under the strict deterministic conditions from §4 (issue #3):**
+
+* **VERSION_CONFLICT** — same `document_id`, **different** `document_version` (always a
+  candidate, regardless of extracted text).
+* **VALUE_CONFLICT** — same `topic_key`, effective windows overlap, structured assertions
+  extracted from ≥2 evidence, **same** key (or keyless) but **different** value.
+* **SCOPE_CONFLICT** — same `topic_key`, structured assertions extracted from ≥2 evidence, but
+  on **different** keys (clearly distinct subjects, e.g. `timeout: 30s` vs `retries: 5`) →
+  complementary, **not** escalated.
+* **Never** from differing full `text` alone: if any involved evidence has
+  `is_structured=False`, the pair is **pass-through** (no candidate).
+
+Then apply the **four explicit auto-resolution rules** from build plan §15.3 in this precedence:
 
 1. **Same source, new version supersedes old (VERSION_CONFLICT, auto).**
    If conflicting evidence share the *same* `document_id` but differ in `document_version`
@@ -274,21 +330,20 @@ For each `topic_key` group, compare the surviving (post-temporal-filter) evidenc
    `POLICY_CONFLICT` (a formal policy / product doc vs an informal contradicting source).
    When the margin is below the threshold, authority does **not** decide → rule 4.
 
-4. **Unresolvable → `contradicted` (no winner).**
+4. **Unresolvable → `CONTRADICTED` (no winner).**
    If none of rules 1–3 applies (e.g. two different authoritative docs, equal authority,
    conflicting values at the same time; or the temporary-rollback case from rule 2 where both
    are effective now) → emit a `finding` with `resolvable=False`, `resolution=UNRESOLVED`,
    list **all** involved `SourceRef`s **and their applicable times**, set
-   `ConflictReport.overall_status = "contradicted"`, and leave `chosen_evidence_ids` empty.
+   `ConflictReport.conflict_status = CONTRADICTED`, and leave `chosen_evidence_ids` empty.
    The system must **not** choose a "most likely" answer.
 
-`SCOPE_CONFLICT`: when evidence under the same `topic_key` clearly concern *different scopes*
-(distinct `document_id` **and** no value overlap but also no contradiction — e.g. two
-deployment targets), classify as `SCOPE_CONFLICT` with `resolution=AUTO_SCOPE`: both are
-retained in `resolved_evidence_ids`, the finding notes the distinct scopes, and it is **not**
-escalated to `contradicted`. (Automatic scope detection is heuristic for MVP: differing
-`document_id` + non-overlapping section/subject signals; conservative — when in doubt, treat
-as a real conflict and escalate, never silently merge.)
+`SCOPE_CONFLICT` (from the detection step): when structured assertions differ on **different**
+keys (clearly distinct subjects), classify as `SCOPE_CONFLICT` with `resolution=AUTO_SCOPE`:
+both are retained in `resolved_evidence_ids`, the finding notes the distinct scopes, and it is
+**not** escalated — `conflict_status` stays `RESOLVED`/`NONE`. (Conservative principle still
+holds: when in doubt about whether two values truly contradict, escalate to `CONTRADICTED`
+rather than silently merge.)
 
 The resolver returns `resolved_evidence_ids` = the surviving (kept) evidence across all
 groups, in deterministic input order; downstream synthesis receives exactly this set.
@@ -309,7 +364,7 @@ Retriever / Executor
   → Evidence collection (authorized, active-version gated)        [unchanged E-011/E-016]
   → Temporal filter    evidence/temporal.py: filter_by_temporal_scope   [NEW]
   → ConflictResolver   evidence/conflict_resolver.py: ConflictResolver.resolve  [NEW]
-  → SufficiencyResult  (judge coverage; resolver sets "contradicted" where unresolved) [wired]
+  → SufficiencyResult  (judge coverage; resolver CONTRADICTED forces overall_status="contradicted") [wired]
   → AnswerEnvelope     (carries ConflictReport; completeness="conflicted")   [extended]
 ```
 
@@ -321,6 +376,16 @@ Retriever / Executor
   merge/dedup and before `_synthesize_multi_corpus`.
 - The `TemporalScope` is derived once via `parse_temporal_scope(query)` at the top of each
   entry point and threaded through filter + resolver (single shared instance — §2).
+- **ChatService conflict rule (frozen, issue #2):** the resolver runs *before* the Sufficiency
+  Judge and only emits `conflict_status` (`NONE` / `RESOLVED` / `CONTRADICTED`) — it never
+  judges `sufficient` / `partially_sufficient` / `insufficient`. After the judge produces its
+  `SufficiencyResult`, the pipeline applies:
+  * `conflict_status == CONTRADICTED` → force the final `SufficiencyResult.overall_status =
+    "contradicted"` (and attach the report + `contradicted_fact_ids`). The resolver never
+    invents any other sufficiency verdict.
+  * `conflict_status in (NONE, RESOLVED)` → the judge's `overall_status` is left **unchanged**.
+  This is exactly what guarantees normal no-conflict questions keep their existing M2–M5
+  behavior.
 - The `AnswerEnvelope` gains **one optional field** (backward-compatible, E-013 lock extended):
 
   ```python
@@ -328,11 +393,11 @@ Retriever / Executor
   ```
 
   `_lock_state` extension: if `conflict_report is not None and
-  conflict_report.overall_status == "contradicted"` then `completeness` MUST be
+  conflict_report.conflict_status == CONTRADICTED` then `completeness` MUST be
   `"conflicted"` (and the answer must enumerate the sources/times from the report). This is
   the *only* envelope change and it does not alter the existing `abstained` / `insufficient`
   lock.
-- Synthesis prompt (`_SYSTEM_PROMPT` / `_build_messages`): when a `contradicted` report is
+- Synthesis prompt (`_SYSTEM_PROMPT` / `_build_messages`): when a `CONTRADICTED` report is
   present, the model is instructed to **present both conflicting sources with their
   applicable times and cite both `evidence_id`s — never pick a single answer**. This is the
   only prompt change; it remains model-free (no new LLM call type).
@@ -349,7 +414,8 @@ pollution cases (build plan risk "旧知识覆盖新知识" + the spec's explici
 requirement) and the four cross-cutting invariants:
 
 1. **Current question, new version covers old** — same `document_id`, v2 vs v1; resolver
-   applies rule 1 (`AUTO_VERSION`), returns v2 only, `overall_status != contradicted`.
+   applies rule 1 (`AUTO_VERSION`), returns v2 only, `conflict_status == RESOLVED`
+   (not `CONTRADICTED`).
 2. **`as_of` historical** — "截至 2025-12-31 …"; temporal filter (rule §3 `as_of`) retains
    only the version effective at that date; the later version is not mis-used.
 3. **Authority conflict** — Product Doc (authority 80) vs Ticket (authority 40) assert
@@ -361,8 +427,9 @@ requirement) and the four cross-cutting invariants:
    with different values, it escalates to `contradicted` (both listed) rather than silently
    choosing v2.
 5. **Unresolvable conflict** — two equal-authority, currently-effective, differing-value
-   sources; `overall_status = contradicted`, no unique conclusion emitted, both
-   `SourceRef`s (with times) preserved.
+   sources (structured assertions on the same key disagree, no authority margin); resolver
+   `conflict_status = CONTRADICTED` → pipeline `SufficiencyResult.overall_status =
+   contradicted`, no unique conclusion emitted, both `SourceRef`s (with times) preserved.
 6. **Knowledge pollution — low-authority vs high-authority** — Ticket(40) vs Product Doc(80)
    conflict resolves to the Product Doc (authority rule), never the reverse.
 7. **Knowledge pollution — new vs old document** — newer `document_version` of the same
@@ -377,7 +444,8 @@ requirement) and the four cross-cutting invariants:
 11. **M2–M5 regression** — full `pytest` (baseline / unit / security / integration / evals)
     stays green; single-corpus Fast Path `answer`, multi-corpus `answer_multi_corpus`, and
     the E-019/E-020 iteration loop behave identically when no temporal/conflict signal exists
-    (`unspecified` scope + no conflict → `ConflictReport` is a no-op pass-through).
+    (`unspecified` scope + no structured-assertion divergence → resolver returns
+    `conflict_status = NONE`, Sufficiency Judge output unchanged).
 12. **Planner unchanged** — `QueryPlan` / `PlanStep` / `executor.py` remain as in E-017/E-018;
     the resolver is reachable without any Planner-core modification (M6 exit gate:
     "不需要修改 Planner 核心协议即可接入").
