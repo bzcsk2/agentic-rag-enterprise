@@ -1697,6 +1697,108 @@ class MetadataStore:
             raise
 
     # ------------------------------------------------------------------ #
+    # Run checkpoints (E-023 contract: persistent iteration-loop recovery)
+    # ------------------------------------------------------------------ #
+    def save_run_checkpoint(self, ck: "RunCheckpoint") -> None:  # noqa: F821 - imported below
+        """Persist (insert or replace) a run checkpoint.
+
+        Denormalizes the identity / status columns for the cross-principal check
+        and cleanup; the full resumable state lives in ``state_json``.
+        """
+        from agentic_rag_enterprise.storage.checkpoint_store import (
+            CHECKPOINT_RUNNING,
+            RunCheckpoint,
+        )
+
+        now = _now_iso()
+        self._conn.execute(
+            """
+            INSERT INTO run_checkpoints (
+                run_id, tenant_id, user_id, session_id, corpus_id, query,
+                policy_version, status, round_index, state_json,
+                created_at, updated_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                tenant_id=excluded.tenant_id,
+                user_id=excluded.user_id,
+                session_id=excluded.session_id,
+                corpus_id=excluded.corpus_id,
+                query=excluded.query,
+                policy_version=excluded.policy_version,
+                status=excluded.status,
+                round_index=excluded.round_index,
+                state_json=excluded.state_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                ck.run_id,
+                ck.tenant_id,
+                ck.user_id,
+                ck.session_id,
+                ck.corpus_id,
+                ck.query,
+                ck.policy_version,
+                CHECKPOINT_RUNNING,  # status is owned by the save/complete/done methods
+                ck.round_index,
+                ck.to_json(),
+                now,
+                now,
+                None,
+            ),
+        )
+
+    def load_run_checkpoint(self, run_id: str) -> "RunCheckpoint | None":  # noqa: F821
+        from agentic_rag_enterprise.storage.checkpoint_store import RunCheckpoint
+
+        row = self._conn.execute(
+            "SELECT * FROM run_checkpoints WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        ck = RunCheckpoint.from_json(row["state_json"])
+        # The denormalized columns must agree with the serialized state (defense
+        # against a partial write); if they don't, treat the checkpoint as broken.
+        if (
+            ck.run_id != row["run_id"]
+            or ck.tenant_id != row["tenant_id"]
+            or ck.user_id != row["user_id"]
+            or ck.session_id != row["session_id"]
+            or ck.corpus_id != row["corpus_id"]
+            or ck.policy_version != row["policy_version"]
+        ):
+            return None
+        return ck
+
+    def mark_run_checkpoint_done(self, run_id: str, *, aborted: bool = False) -> None:
+        from agentic_rag_enterprise.storage.checkpoint_store import (
+            CHECKPOINT_ABORTED,
+            CHECKPOINT_COMPLETED,
+        )
+
+        status = CHECKPOINT_ABORTED if aborted else CHECKPOINT_COMPLETED
+        self._conn.execute(
+            "UPDATE run_checkpoints SET status=?, updated_at=? WHERE run_id=?",
+            (status, _now_iso(), run_id),
+        )
+
+    def list_run_checkpoints(
+        self, *, tenant_id: str, user_id: str, session_id: str
+    ) -> list["RunCheckpoint"]:  # noqa: F821
+        from agentic_rag_enterprise.storage.checkpoint_store import RunCheckpoint
+
+        rows = self._conn.execute(
+            "SELECT * FROM run_checkpoints WHERE tenant_id=? AND user_id=? AND session_id=?",
+            (tenant_id, user_id, session_id),
+        ).fetchall()
+        out: list[RunCheckpoint] = []
+        for row in rows:
+            try:
+                out.append(RunCheckpoint.from_json(row["state_json"]))
+            except Exception:  # noqa: BLE001 - skip corrupt rows
+                continue
+        return out
+
+    # ------------------------------------------------------------------ #
     # Row <-> model mapping
     # ------------------------------------------------------------------ #
     def _document_columns(self, doc: SourceDocument) -> dict:

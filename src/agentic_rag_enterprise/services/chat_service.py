@@ -23,6 +23,7 @@ back from, the model — they are strictly runtime-injected (build plan §5.4).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, cast
 
 from agentic_rag_enterprise.answer import build_answer_envelope, conservative_refusal
@@ -64,6 +65,11 @@ from agentic_rag_enterprise.retrieval.fast_path import (
     FastPathSufficiency,
     run_fast_path,
 )
+from agentic_rag_enterprise.storage.checkpoint_store import (
+    RunCheckpoint,
+    ResumeAuthError,
+    reauthorize_evidence,
+)
 from agentic_rag_enterprise.retrieval.models import (
     CorpusNotDiscoverableError,
     ParentAuthorizationError,
@@ -82,7 +88,9 @@ from agentic_rag_enterprise.storage.vector_store import DenseEncoder, SparseEnco
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from agentic_rag_enterprise.corpus.registry import CorpusRegistry
     from agentic_rag_enterprise.judge.protocol import Judge
+    from agentic_rag_enterprise.storage.metadata_store import MetadataStore
 
 
 class ChatServiceError(Exception):
@@ -96,6 +104,37 @@ class ModelInvocationError(ChatServiceError):
     grounded answer or a conservative refusal (build plan §5.4: the LLM is not a
     security boundary, and a fault is not an answer).
     """
+
+
+@dataclass
+class _IterationState:
+    """Mutable working copy of the iteration-loop accumulators.
+
+    Rebuilt from a :class:`RunCheckpoint` on resume; the frozen checkpoint itself
+    is never mutated in place.
+    """
+
+    evidence_by_id: dict[str, SnapshotEvidence]
+    seen_ids: set[str]
+    seen_text_hashes: set[str]
+    seen_doc_versions: set[tuple[str, str]]
+    prior_queries: list[str]
+    coverage: SufficiencyResult | None
+    gap_rounds: int
+    retrieval_calls: int
+    prev_covered: set[str]
+    final_reason: str | None
+    scope: TemporalScope
+    final_report: ConflictReport | None
+    final_evidence: tuple[SnapshotEvidence, ...]
+    conflict_stop: bool
+
+
+class _BreakLoop(Exception):
+    """Internal control-flow signal: stop the iteration loop (equivalent to the
+    original ``break``). Used for normal stop reasons — conflict detected,
+    ``no_new_evidence``, ``all_sources_exhausted`` — where the loop ends but the
+    answer is still finalized from ``state`` (not returned mid-round)."""
 
 
 _SYSTEM_PROMPT = (
@@ -222,6 +261,8 @@ class ChatService:
         registry: CorpusRegistry | None = None,
         router: CorpusRouter | None = None,
         top_k: int | None = None,
+        metadata_store: MetadataStore | None = None,
+        judge: Judge | None = None,
     ) -> None:
         self._retriever = retriever
         self._dense_encoder = dense_encoder
@@ -232,20 +273,28 @@ class ChatService:
         self._router = router or CorpusRouter()
         self._multi = MultiCorpusRetrieval(retriever)
         self._top_k = top_k
+        self._metadata_store = metadata_store
+        self._judge = judge
 
     def answer(
         self,
         query: str,
         ctx: SecurityContext,
         corpus_id: str,
+        *,
+        run_id: str | None = None,
     ) -> AnswerEnvelope:
         """Answer one query over one corpus via the one-pass Fast Path (E-014).
 
         Equivalent to ``answer_with_iteration(max_rounds=1, judge=None)``: the
         E-019/E-020 judge + loop are not engaged, so all E-014 behaviour
         (including the ``insufficient`` → abstain short-circuit) is preserved.
+        The single-pass path is not checkpointed, so ``run_id`` is accepted and
+        ignored here (use ``answer_with_iteration`` with a judge for checkpointing).
         """
-        return self.answer_with_iteration(query, ctx, corpus_id, max_rounds=1, judge=None)
+        return self.answer_with_iteration(
+            query, ctx, corpus_id, max_rounds=1, judge=None, run_id=run_id
+        )
 
     def _run_conflict_stage(
         self,
@@ -532,6 +581,7 @@ class ChatService:
         max_rounds: int = 3,
         judge: Judge | None = None,
         required_facts: list[RequiredFact] | None = None,
+        run_id: str | None = None,
     ) -> AnswerEnvelope:
         """Answer with the E-019/E-020 bounded, gap-driven quality iteration.
 
@@ -552,6 +602,10 @@ class ChatService:
         fault (``JudgeTimeoutError`` / ``JudgeError``) degrades conservatively to
         an abstain — it is never relabelled as a grounded answer.
 
+        When ``run_id`` is given, a :class:`RunCheckpoint` is persisted after each
+        completed round (and on completion) so a crashed run can be resumed by
+        ``resume_run`` (E-023). The single-pass ``answer`` path is not checkpointed.
+
         Args:
             query: The user question.
             ctx: The runtime-injected security context.
@@ -561,6 +615,8 @@ class ChatService:
                 Internal MVP). When ``None`` the loop is not engaged.
             required_facts: Explicit Required Facts; when omitted they are derived
                 heuristically from the query.
+            run_id: Optional stable id; when set, the run is checkpointed for
+                later resume (E-023).
         """
         if judge is None:
             return self._run_single_pass(query, ctx, corpus_id)
@@ -597,192 +653,381 @@ class ChatService:
             # lock holds: abstain ⇒ stop_reason == no_evidence.
             return conservative_refusal(first_result, ctx, gap_rounds=1, iterations=1, tool_calls=1)
 
-        evidence_by_id: dict[str, SnapshotEvidence] = {
-            ev.evidence_id: ev for ev in first_result.evidence
-        }
-        seen_ids: set[str] = set(evidence_by_id)
-        # Seed novelty trackers with round-0 evidence so a repeated gap snapshot
-        # (same text / same doc version) is not mistaken for new evidence (P2-2).
-        seen_text_hashes: set[str] = {ev.text_hash for ev in first_result.evidence}
-        seen_doc_versions: set[tuple[str, str]] = {
-            (ev.document_id, ev.document_version) for ev in first_result.evidence
-        }
-        prior_queries = [query]
-        coverage: SufficiencyResult | None = None
-        gap_rounds = 0
-        retrieval_calls = 1  # round 0 counts as one retrieval pass
-        prev_covered: set[str] = set()
-        final_reason = first_result.stop_reason.value  # real termination reason (P2-1)
-
-        # Parse the TemporalScope ONCE for the whole request; the conflict stage
-        # reuses it every round instead of re-parsing the query (P1-2).
+        # Parse the TemporalScope ONCE for the whole request (P1-2); reused every
+        # round instead of re-parsing the query.
         scope = parse_temporal_scope(query)
+        state = self._build_initial_state(query, first_result, corpus.corpus_id, scope)
 
-        # Per-round conflict-stage results, surfaced for synthesis after the loop.
-        final_report: ConflictReport | None = None
-        final_evidence: tuple[SnapshotEvidence, ...] = tuple(evidence_by_id.values())
-        conflict_stop = False
+        # Persist a checkpoint before the loop (round 0 already retrieved).
+        if run_id is not None:
+            self._save_checkpoint(
+                run_id,
+                ctx,
+                state,
+                first_result=first_result,
+                required=required,
+                max_rounds=max_rounds,
+                query=query,
+                corpus_id=corpus.corpus_id,
+                round_index=0,
+            )
 
         for round_idx in range(max_rounds):
-            gap_rounds = round_idx + 1
-
-            if round_idx == 0:
-                # Already retrieved via run_fast_path; everything is "new" this round.
-                new_evidence_ids: set[str] = set(seen_ids)
-                round_new_content = False
-            else:
-                # Coverage is always set by round 0's judge call above.
-                assert coverage is not None
-                plan = gap_planner.plan(coverage, prior_queries=prior_queries, corpus_id=corpus_id)
-                # Only the candidate queries not yet executed this loop survive.
-                pending = [q for q in plan.queries if q not in prior_queries]
-                if not pending:
-                    # Every candidate gap query has already been executed; there is
-                    # nothing left to retrieve. This round did no work, so it must
-                    # NOT be counted as an executed round (P1-2): gap_rounds /
-                    # iterations reflect rounds that actually ran retrieval + judge.
-                    final_reason = "all_sources_exhausted"
-                    gap_rounds = round_idx
-                    break
-                # Execute exactly ONE new gap query this round (build plan §14.4/§14.5
-                # spirit). Running a single query per round lets two *distinct*
-                # gainless retrievals span two rounds and reach the `no_new_evidence`
-                # stop (P1-1) instead of being collapsed into one round that exhausts
-                # every candidate at once.
-                q = pending[0]
-                new_evidence_ids = set()
-                round_new_content = False
-                try:
-                    evs = self._retriever.retrieve_evidence(
-                        ctx,
-                        q,
-                        corpus,
-                        self._top_k,
-                        dense_encoder=self._dense_encoder,
-                        sparse_encoder=self._sparse_encoder,
-                        iteration=round_idx,
-                    )
-                except Exception as exc:  # noqa: BLE001 - surfaced as a backend fault
-                    raise FastPathBackendError(
-                        f"gap retrieval failed for corpus {corpus_id!r}: {exc}"
-                    ) from exc
-                retrieval_calls += 1
-                for ev in evs:
-                    # Fail-closed: a gap snapshot from another tenant/corpus must
-                    # never enter the answer (P1-1). This mirrors the E-013
-                    # cross-tenant guard that the M3 accumulation had regressed.
-                    if ev.tenant_id != ctx.tenant_id or ev.corpus_id != corpus.corpus_id:
-                        raise TenantBindingError(
-                            f"gap evidence {ev.evidence_id!r} tenant/corpus "
-                            f"({ev.tenant_id}/{ev.corpus_id}) does not match request "
-                            f"({ctx.tenant_id}/{corpus.corpus_id})"
-                        )
-                    is_new_content = (
-                        ev.text_hash not in seen_text_hashes
-                        or (ev.document_id, ev.document_version) not in seen_doc_versions
-                    )
-                    existing = evidence_by_id.get(ev.evidence_id)
-                    if existing is None:
-                        seen_ids.add(ev.evidence_id)
-                        evidence_by_id[ev.evidence_id] = ev
-                        # P2-2: a brand-new id only counts as a *gain* when it
-                        # actually carries new information. A snapshot that merely
-                        # re-states already-seen text under a fresh id (e.g. the
-                        # same paragraph re-embedded) must NOT reset the no-gain
-                        # counter — only a new id with new content/version does.
-                        if is_new_content:
-                            new_evidence_ids.add(ev.evidence_id)
-                    elif (
-                        existing.document_version != ev.document_version
-                        or existing.text_hash != ev.text_hash
-                    ):
-                        # Same id but an updated snapshot: keep the latest version
-                        # so a new document version / new text is reflected in the
-                        # answer (§14.6); the gain signal is `round_new_content`.
-                        evidence_by_id[ev.evidence_id] = ev
-                    # §14.6 novelty: a new document version or new text hash is a
-                    # genuine gain even when the id was already seen (P2-2).
-                    if is_new_content:
-                        round_new_content = True
-                    seen_text_hashes.add(ev.text_hash)
-                    seen_doc_versions.add((ev.document_id, ev.document_version))
-                if q not in prior_queries:
-                    prior_queries.append(q)
-
-            # --- E-021 conflict stage (P1-2): run BEFORE the Judge each round ---
-            current_evidence = tuple(evidence_by_id.values())
-            report, kept_evidence = self._run_conflict_stage(query, current_evidence, scope=scope)
-            if not kept_evidence:
-                # Temporal filter dropped every surviving evidence this round (all
-                # expired / not-yet-effective / outside the window). Refuse without
-                # invoking the model (P1-1).
-                return build_no_evidence_refusal(
-                    ctx,
-                    corpora_used=(corpus.corpus_id,),
-                    tool_calls=retrieval_calls,
-                    gap_rounds=gap_rounds,
-                    iterations=gap_rounds,
-                )
-            if report.conflict_status == ConflictStatus.CONTRADICTED:
-                # A contradiction cannot be auto-resolved: stop iterating and
-                # surface both sources; do not run further gap retrieval (P1-2).
-                final_report = report
-                final_evidence = kept_evidence
-                coverage = _contradicted_coverage()
-                conflict_stop = True
-                final_reason = "conflict_detected"
-                break
-            # NONE / RESOLVED: the Coverage Judge only ever sees the
-            # resolved/retained evidence (P1-2).
-            final_report = report
-            final_evidence = kept_evidence
-
-            # Stage A: judge coverage over the conflict-filtered evidence.
-            prev_covered = set(coverage.covered_fact_ids) if coverage else set()
             try:
-                coverage = judge.judge(query=query, required_facts=required, evidence=kept_evidence)
-            except (JudgeTimeoutError, JudgeError) as exc:
-                # Judge fault: degrade conservatively (abstain), never fabricate.
-                logger.warning("coverage judge failed; degrading conservatively: %s", exc)
-                return conservative_refusal(
-                    first_result,
+                terminal = self._run_round(
+                    state,
+                    round_idx,
+                    query,
                     ctx,
-                    coverage=SufficiencyResult(
-                        overall_status="insufficient",
-                        should_abstain=True,
-                        fact_coverage=(),
-                    ),
-                    gap_rounds=gap_rounds,
-                    iterations=gap_rounds,
-                    tool_calls=retrieval_calls,
+                    corpus,
+                    first_result,
+                    judge,
+                    required,
+                    gap_planner,
+                    stop_policy,
+                    max_rounds,
+                    corpus.corpus_id,
                 )
+            except _BreakLoop:
+                # A stop condition fired (all_sources_exhausted / conflict /
+                # StopPolicy.should_stop). Persist the final checkpoint at the
+                # next round boundary, mark the run done, and synthesize.
+                if run_id is not None and self._metadata_store is not None:
+                    self._save_checkpoint(
+                        run_id,
+                        ctx,
+                        state,
+                        first_result=first_result,
+                        required=required,
+                        max_rounds=max_rounds,
+                        query=query,
+                        corpus_id=corpus.corpus_id,
+                        round_index=round_idx + 1,
+                    )
+                    self._metadata_store.mark_run_checkpoint_done(run_id)
+                return self._finalize_iteration(query, ctx, first_result, state, verifier)
+            if run_id is not None:
+                self._save_checkpoint(
+                    run_id,
+                    ctx,
+                    state,
+                    first_result=first_result,
+                    required=required,
+                    max_rounds=max_rounds,
+                    query=query,
+                    corpus_id=corpus.corpus_id,
+                    round_index=round_idx + 1,
+                )
+            if terminal is not None:
+                if run_id is not None and self._metadata_store is not None:
+                    self._metadata_store.mark_run_checkpoint_done(run_id)
+                return terminal
 
-            new_covered = set(coverage.covered_fact_ids) - prev_covered
+        result = self._finalize_iteration(query, ctx, first_result, state, verifier)
+        if run_id is not None and self._metadata_store is not None:
+            self._metadata_store.mark_run_checkpoint_done(run_id)
+        return result
 
-            decision = stop_policy.decide(
-                round=round_idx,
-                max_rounds=max_rounds,
-                overall_status=coverage.overall_status,
-                can_continue=coverage.can_continue_retrieval,
-                new_evidence_ids=new_evidence_ids,
-                new_covered_fact_ids=new_covered,
-                judge_ok=True,
-                budget_remaining=1.0,
-                new_content=round_new_content,
+    # ------------------------------------------------------------------ #
+    # E-023: checkpoint + resume primitives
+    # ------------------------------------------------------------------ #
+    def _build_initial_state(
+        self,
+        query: str,
+        first_result: FastPathResult,
+        corpus_id: str,
+        scope: "TemporalScope",
+    ) -> _IterationState:
+        """Build the initial loop working state from the round-0 fast path."""
+        evidence_by_id = {ev.evidence_id: ev for ev in first_result.evidence}
+        seen_ids = set(evidence_by_id)
+        seen_text_hashes = {ev.text_hash for ev in first_result.evidence}
+        seen_doc_versions = {
+            (ev.document_id, ev.document_version) for ev in first_result.evidence
+        }
+        return _IterationState(
+            evidence_by_id=evidence_by_id,
+            seen_ids=seen_ids,
+            seen_text_hashes=seen_text_hashes,
+            seen_doc_versions=seen_doc_versions,
+            prior_queries=[query],
+            coverage=None,
+            gap_rounds=0,
+            retrieval_calls=1,  # round 0 counts as one retrieval pass
+            prev_covered=set(),
+            final_reason=first_result.stop_reason.value,  # P2-1 real termination reason
+            scope=scope,
+            final_report=None,
+            final_evidence=tuple(evidence_by_id.values()),
+            conflict_stop=False,
+        )
+
+    def _build_state_from_checkpoint(
+        self, ck: RunCheckpoint, surviving: list[SnapshotEvidence]
+    ) -> _IterationState:
+        """Rebuild loop working state from a checkpoint over RE-AUTHORIZED evidence.
+
+        Only ``surviving`` (still-authorized) evidence is carried forward; the
+        trackers are rebuilt from it. ``final_evidence`` is re-seeded from the
+        checkpoint's last conflict-stage ids so a completed run can be finalized
+        without re-running rounds (E-023 re-auth: dropped evidence never returns).
+        """
+        evidence_by_id = {ev.evidence_id: ev for ev in surviving}
+        seen_ids = set(evidence_by_id)
+        seen_text_hashes = {ev.text_hash for ev in surviving}
+        seen_doc_versions = {(ev.document_id, ev.document_version) for ev in surviving}
+        coverage = ck.coverage
+        fe_ids = set(ck.final_evidence_ids)
+        final_evidence = (
+            tuple(ev for ev in surviving if ev.evidence_id in fe_ids)
+            if fe_ids
+            else tuple(evidence_by_id.values())
+        )
+        return _IterationState(
+            evidence_by_id=evidence_by_id,
+            seen_ids=seen_ids,
+            seen_text_hashes=seen_text_hashes,
+            seen_doc_versions=seen_doc_versions,
+            prior_queries=list(ck.prior_queries),
+            coverage=coverage,
+            gap_rounds=ck.gap_rounds,
+            retrieval_calls=ck.retrieval_calls,
+            prev_covered=set(coverage.covered_fact_ids) if coverage else set(),
+            final_reason=ck.final_reason,
+            scope=parse_temporal_scope(ck.query),
+            final_report=ck.final_report,
+            final_evidence=final_evidence,
+            conflict_stop=ck.conflict_stop,
+        )
+
+    def _run_round(
+        self,
+        state: _IterationState,
+        round_idx: int,
+        query: str,
+        ctx: SecurityContext,
+        corpus: CorpusConfig,
+        first_result: FastPathResult,
+        judge: Judge,
+        required: list[RequiredFact],
+        gap_planner: GapPlanner,
+        stop_policy: StopPolicy,
+        max_rounds: int,
+        corpus_id: str,
+    ) -> AnswerEnvelope | None:
+        """Execute one iteration round.
+
+        Returns an :class:`AnswerEnvelope` only when the round is *terminal*
+        (insufficient / no-evidence / judge fault) — the caller returns it
+        immediately. Otherwise returns ``None`` (the caller persists the
+        checkpoint and continues, or synthesizes after the loop).
+        """
+        state.gap_rounds = round_idx + 1
+
+        if round_idx == 0:
+            # Already retrieved via run_fast_path; everything is "new" this round.
+            new_evidence_ids: set[str] = set(state.seen_ids)
+            round_new_content = False
+        else:
+            # Coverage is always set by round 0's judge call above.
+            assert state.coverage is not None
+            plan = gap_planner.plan(
+                state.coverage, prior_queries=state.prior_queries, corpus_id=corpus_id
             )
-            final_reason = decision.reason  # surface the real stop reason (P2-1)
-            if decision.should_stop:
-                break
+            # Only the candidate queries not yet executed this loop survive.
+            pending = [q for q in plan.queries if q not in state.prior_queries]
+            if not pending:
+                # Nothing left to retrieve; this round did no work, so it must NOT
+                # be counted as an executed round (P1-2).
+                state.final_reason = "all_sources_exhausted"
+                state.gap_rounds = round_idx
+                raise _BreakLoop()
+            # Execute exactly ONE new gap query this round (build plan §14.4/§14.5
+            # spirit). Running a single query per round lets two *distinct*
+            # gainless retrievals span two rounds and reach the `no_new_evidence`
+            # stop (P1-1) instead of being collapsed into one round.
+            q = pending[0]
+            new_evidence_ids = set()
+            round_new_content = False
+            try:
+                evs = self._retriever.retrieve_evidence(
+                    ctx,
+                    q,
+                    corpus,
+                    self._top_k,
+                    dense_encoder=self._dense_encoder,
+                    sparse_encoder=self._sparse_encoder,
+                    iteration=round_idx,
+                )
+            except Exception as exc:  # noqa: BLE001 - surfaced as a backend fault
+                raise FastPathBackendError(
+                    f"gap retrieval failed for corpus {corpus_id!r}: {exc}"
+                ) from exc
+            state.retrieval_calls += 1
+            for ev in evs:
+                # Fail-closed: a gap snapshot from another tenant/corpus must
+                # never enter the answer (P1-1). Mirrors the E-013 cross-tenant
+                # guard that the M3 accumulation had regressed.
+                if ev.tenant_id != ctx.tenant_id or ev.corpus_id != corpus.corpus_id:
+                    raise TenantBindingError(
+                        f"gap evidence {ev.evidence_id!r} tenant/corpus "
+                        f"({ev.tenant_id}/{ev.corpus_id}) does not match request "
+                        f"({ctx.tenant_id}/{corpus.corpus_id})"
+                    )
+                is_new_content = (
+                    ev.text_hash not in state.seen_text_hashes
+                    or (ev.document_id, ev.document_version) not in state.seen_doc_versions
+                )
+                existing = state.evidence_by_id.get(ev.evidence_id)
+                if existing is None:
+                    state.seen_ids.add(ev.evidence_id)
+                    state.evidence_by_id[ev.evidence_id] = ev
+                    # P2-2: a brand-new id only counts as a *gain* when it actually
+                    # carries new information; a re-stated snapshot under a fresh id
+                    # must NOT reset the no-gain counter.
+                    if is_new_content:
+                        new_evidence_ids.add(ev.evidence_id)
+                elif (
+                    existing.document_version != ev.document_version
+                    or existing.text_hash != ev.text_hash
+                ):
+                    # Same id but an updated snapshot: keep the latest version so a
+                    # new document version / new text is reflected (§14.6).
+                    state.evidence_by_id[ev.evidence_id] = ev
+                # §14.6 novelty: a new document version or new text hash is a genuine
+                # gain even when the id was already seen (P2-2).
+                if is_new_content:
+                    round_new_content = True
+                state.seen_text_hashes.add(ev.text_hash)
+                state.seen_doc_versions.add((ev.document_id, ev.document_version))
+            if q not in state.prior_queries:
+                state.prior_queries.append(q)
 
-        # Synthesis. When the loop stopped on a contradiction, ``coverage`` is
-        # already the contradicted verdict and ``final_report``/``final_evidence``
-        # carry the conflict stage output; otherwise they hold the last round's
-        # verdict. The conflict report forces completeness="conflicted".
-        coverage2 = coverage
+        # --- E-021 conflict stage (P1-2): run BEFORE the Judge each round ---
+        current_evidence = tuple(state.evidence_by_id.values())
+        report, kept_evidence = self._run_conflict_stage(
+            query, current_evidence, scope=state.scope
+        )
+        if not kept_evidence:
+            # Temporal filter dropped every surviving evidence (all expired /
+            # not-yet-effective / outside the window). Refuse without the model (P1-1).
+            return build_no_evidence_refusal(
+                ctx,
+                corpora_used=(corpus.corpus_id,),
+                tool_calls=state.retrieval_calls,
+                gap_rounds=state.gap_rounds,
+                iterations=state.gap_rounds,
+            )
+        if report.conflict_status == ConflictStatus.CONTRADICTED:
+            # A contradiction cannot be auto-resolved: stop iterating and surface
+            # both sources; do not run further gap retrieval (P1-2).
+            state.final_report = report
+            state.final_evidence = kept_evidence
+            state.coverage = _contradicted_coverage()
+            state.conflict_stop = True
+            state.final_reason = "conflict_detected"
+            raise _BreakLoop()
+        # NONE / RESOLVED: the Coverage Judge only ever sees the resolved/retained
+        # evidence (P1-2).
+        state.final_report = report
+        state.final_evidence = kept_evidence
+
+        # Stage A: judge coverage over the conflict-filtered evidence.
+        state.prev_covered = set(state.coverage.covered_fact_ids) if state.coverage else set()
+        try:
+            state.coverage = judge.judge(
+                query=query, required_facts=required, evidence=kept_evidence
+            )
+        except (JudgeTimeoutError, JudgeError) as exc:
+            # Judge fault: degrade conservatively (abstain), never fabricate.
+            logger.warning("coverage judge failed; degrading conservatively: %s", exc)
+            return conservative_refusal(
+                first_result,
+                ctx,
+                coverage=SufficiencyResult(
+                    overall_status="insufficient",
+                    should_abstain=True,
+                    fact_coverage=(),
+                ),
+                gap_rounds=state.gap_rounds,
+                iterations=state.gap_rounds,
+                tool_calls=state.retrieval_calls,
+            )
+
+        new_covered = set(state.coverage.covered_fact_ids) - state.prev_covered
+
+        decision = stop_policy.decide(
+            round=round_idx,
+            max_rounds=max_rounds,
+            overall_status=state.coverage.overall_status,
+            can_continue=state.coverage.can_continue_retrieval,
+            new_evidence_ids=new_evidence_ids,
+            new_covered_fact_ids=new_covered,
+            judge_ok=True,
+            budget_remaining=1.0,
+            new_content=round_new_content,
+        )
+        state.final_reason = decision.reason  # surface the real stop reason (P2-1)
+        if decision.should_stop:
+            raise _BreakLoop()
+        return None
+
+    def _save_checkpoint(
+        self,
+        run_id: str,
+        ctx: SecurityContext,
+        state: _IterationState,
+        *,
+        first_result: FastPathResult,
+        required: list[RequiredFact],
+        max_rounds: int,
+        query: str,
+        corpus_id: str,
+        round_index: int,
+    ) -> None:
+        """Persist the current loop state as a ``run_checkpoints`` row (E-023)."""
+        if self._metadata_store is None:
+            return
+        ck = RunCheckpoint(
+            run_id=run_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            session_id=ctx.session_id,
+            policy_version=ctx.policy_version,
+            query=query,
+            corpus_id=corpus_id,
+            max_rounds=max_rounds,
+            required_facts=list(required),
+            round_index=round_index,
+            evidence=tuple(state.evidence_by_id.values()),
+            prior_queries=list(state.prior_queries),
+            seen_text_hashes=list(state.seen_text_hashes),
+            seen_doc_versions=list(state.seen_doc_versions),
+            retrieval_calls=state.retrieval_calls,
+            gap_rounds=state.gap_rounds,
+            final_reason=state.final_reason,
+            conflict_stop=state.conflict_stop,
+            coverage=state.coverage,
+            final_report=state.final_report,
+            final_evidence_ids=[ev.evidence_id for ev in state.final_evidence],
+            first_result=first_result,
+        )
+        self._metadata_store.save_run_checkpoint(ck)
+
+    def _finalize_iteration(
+        self,
+        query: str,
+        ctx: SecurityContext,
+        first_result: FastPathResult,
+        state: _IterationState,
+        verifier: DeterministicClaimEvidenceVerifier,
+    ) -> AnswerEnvelope:
+        """Synthesize the final envelope from the loop's terminal state."""
+        coverage2 = state.coverage
         if (
-            conflict_stop
-            and final_report is not None
-            and final_report.conflict_status == ConflictStatus.CONTRADICTED
+            state.conflict_stop
+            and state.final_report is not None
+            and state.final_report.conflict_status == ConflictStatus.CONTRADICTED
         ):
             coverage2 = _contradicted_coverage()
         return self._synthesize(
@@ -791,13 +1036,137 @@ class ChatService:
             first_result,
             coverage=coverage2,
             verifier=verifier,
-            evidence=final_evidence,
-            gap_rounds=gap_rounds,
-            iterations=gap_rounds,
-            tool_calls=retrieval_calls,
-            stop_reason=final_reason,
-            conflict_report=final_report,
+            evidence=state.final_evidence,
+            gap_rounds=state.gap_rounds,
+            iterations=state.gap_rounds,
+            tool_calls=state.retrieval_calls,
+            stop_reason=state.final_reason,
+            conflict_report=state.final_report,
         )
+
+    def resume_run(
+        self,
+        run_id: str,
+        ctx: SecurityContext,
+        *,
+        judge: Judge | None = None,
+    ) -> AnswerEnvelope:
+        """Resume a checkpointed iteration loop, re-authorizing against CURRENT state.
+
+        The security-critical E-023 guarantee: a resumed run is re-checked before
+        any further retrieval/synthesis. Fail-closed — any of the following aborts
+        the resume (raises :class:`ResumeAuthError`, mapped to a generic 5xx by the
+        API) or drops evidence (never leaks data the principal can no longer read):
+
+        * missing / aborted / foreign checkpoint (``run_id`` not found, or a
+          different ``tenant_id`` / ``user_id`` / ``session_id``);
+        * ``policy_version`` changed since the checkpoint was written (the stored
+          authorization basis is stale);
+        * the corpus is no longer discoverable for ``ctx``;
+        * any gathered Evidence whose document is deleted / deprecated / re-versioned
+          or whose current ACL denies ``ctx`` (build plan §3623 — "ACL 收紧不因旧
+          Cache/Checkpoint 泄露"). Dropped evidence is recorded as a
+          ``resume_evidence_revoked`` control-plane finding.
+
+        Given identical re-auth outcomes, the resumed answer equals an uninterrupted
+        run (deterministic).
+        """
+        if self._metadata_store is None:
+            raise ResumeAuthError("metadata_store_unavailable")
+        active_judge = judge or self._judge
+        if active_judge is None:
+            raise ResumeAuthError("judge_required")
+        ck = self._metadata_store.load_run_checkpoint(run_id)
+        if ck is None:
+            raise ResumeAuthError("checkpoint_not_found")
+
+        # 1) Cross-principal resume is refused (fail closed).
+        if (
+            ck.tenant_id != ctx.tenant_id
+            or ck.user_id != ctx.user_id
+            or ck.session_id != ctx.session_id
+        ):
+            raise ResumeAuthError("principal_mismatch")
+
+        # 2) The authorization basis must be current (stale policy → abort).
+        if ck.policy_version != ctx.policy_version:
+            raise ResumeAuthError("policy_version_changed")
+
+        # 3) Corpus discoverability re-check (whole-run gate).
+        if self._registry is None:
+            raise ResumeAuthError("registry_unavailable")
+        try:
+            self._registry.get(ck.corpus_id, ctx)
+        except Exception:  # noqa: BLE001 - any discoverability failure aborts
+            raise ResumeAuthError("corpus_not_discoverable")
+
+        # 4) Re-authorize each gathered Evidence against CURRENT metadata.
+        surviving: list[SnapshotEvidence] = []
+        for ev in ck.evidence:
+            kept, reason = reauthorize_evidence(
+                ev, ctx, metadata_store=self._metadata_store, registry=self._registry
+            )
+            if kept:
+                surviving.append(ev)
+            else:
+                # Fail closed: drop the now-unauthorized evidence and record it for
+                # audit. The dropped evidence must never re-surface (invariant 1).
+                self._metadata_store.record_control_plane_finding(
+                    corpus_id=ev.corpus_id,
+                    kind="resume_evidence_revoked",
+                    tenant_id=ev.tenant_id,
+                    document_id=ev.document_id,
+                    document_version=ev.document_version,
+                    detail=f"evidence {ev.evidence_id} dropped on resume: {reason}",
+                )
+        if not surviving:
+            # No authorized evidence remains → refuse without invoking the model.
+            return build_no_evidence_refusal(ctx, corpora_used=(ck.corpus_id,))
+
+        corpus = self._resolve_corpus(ck.corpus_id)
+        stop_policy = StopPolicy()
+        gap_planner = GapPlanner()
+        verifier = DeterministicClaimEvidenceVerifier()
+        state = self._build_state_from_checkpoint(ck, surviving)
+
+        # The checkpoint may already represent a *finished* run (a retried
+        # resume, or a run that reached sufficiency/conflict and stopped). If the
+        # stored coverage is already terminal (sufficient / contradicted), there
+        # is nothing left to iterate: finalize directly so the resumed envelope is
+        # byte-for-byte identical to the uninterrupted run (invariant 4 — the
+        # original stop_reason is preserved instead of being over-written by a
+        # re-run of empty gap rounds).
+        if ck.coverage is not None and ck.coverage.overall_status in ("sufficient", "contradicted"):
+            self._metadata_store.mark_run_checkpoint_done(run_id)
+            return self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
+
+        for round_idx in range(ck.round_index, ck.max_rounds):
+            try:
+                terminal = self._run_round(
+                    state,
+                    round_idx,
+                    ck.query,
+                    ctx,
+                    corpus,
+                    ck.first_result,
+                    active_judge,
+                    ck.required_facts,
+                    gap_planner,
+                    stop_policy,
+                    ck.max_rounds,
+                    ck.corpus_id,
+                )
+            except _BreakLoop:
+                self._metadata_store.mark_run_checkpoint_done(run_id)
+                return self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
+            if terminal is not None:
+                self._metadata_store.mark_run_checkpoint_done(run_id)
+                return terminal
+
+        result = self._finalize_iteration(ck.query, ctx, ck.first_result, state, verifier)
+        self._metadata_store.mark_run_checkpoint_done(run_id)
+        return result
+
 
     def _run_single_pass(
         self,

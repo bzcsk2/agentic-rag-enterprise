@@ -246,3 +246,44 @@ def test_v1_chat_error_response_does_not_leak_internals() -> None:
     text = resp.text.lower()
     assert "secret-ev" not in text
     assert "t2" not in text
+
+
+class _FakeMetaStore:
+    """Minimal metadata store fake: no checkpoint ever exists (resume → not found)."""
+
+    def load_run_checkpoint(self, run_id: str) -> object:
+        return None
+
+    def record_control_plane_finding(self, **_: object) -> None:
+        return None
+
+
+def _client_with_metadata(payload: object, extraction: ClaimExtraction) -> TestClient:
+    service = _build_service(payload, extraction)
+    service._metadata_store = _FakeMetaStore()  # type: ignore[assignment]
+    return _client(service)
+
+
+def test_v1_chat_resume_without_run_id_returns_400() -> None:
+    # Per contract §E-023 (api/schemas.py): ``resume`` without ``run_id`` is a
+    # client error; never synthesize from a non-existent checkpoint.
+    client = _client_with_metadata(
+        [_evidence("e1")], ClaimExtraction(draft_answer="x", claims=[])
+    )
+    resp = client.post("/v1/chat", json=_body(resume=True), headers=_HEADERS)
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Resume requested without a run_id."
+
+
+def test_v1_chat_resume_unknown_run_id_returns_404_generic() -> None:
+    # A resume for a missing / foreign checkpoint must NOT leak the reason; the
+    # API maps ResumeAuthError to a fixed generic message at 404.
+    client = _client_with_metadata(
+        [_evidence("e1")], ClaimExtraction(draft_answer="x", claims=[])
+    )
+    resp = client.post(
+        "/v1/chat", json=_body(resume=True, run_id="does-not-exist"), headers=_HEADERS
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "An internal error occurred."
+    assert "does-not-exist" not in resp.text.lower()

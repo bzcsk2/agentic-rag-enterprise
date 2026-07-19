@@ -26,6 +26,7 @@ from agentic_rag_enterprise.services.chat_service import (
     ChatServiceError,
     ModelInvocationError,
 )
+from agentic_rag_enterprise.storage.checkpoint_store import ResumeAuthError
 
 logger = logging.getLogger("agentic_rag_enterprise.api.chat")
 
@@ -34,6 +35,9 @@ logger = logging.getLogger("agentic_rag_enterprise.api.chat")
 _MSG_BACKEND_UNAVAILABLE = "The retrieval backend is temporarily unavailable."
 _MSG_MODEL_UNAVAILABLE = "The answer service is temporarily unavailable."
 _MSG_INTERNAL_ERROR = "An internal error occurred."
+_MSG_RESUME_BAD_REQUEST = "Resume requested without a run_id."
+
+_STATUS_CHECKPOINT_NOT_FOUND = status.HTTP_404_NOT_FOUND
 
 
 def chat_v1(
@@ -42,7 +46,26 @@ def chat_v1(
     service: ChatService = Depends(get_chat_service),
 ) -> ChatResponse:
     try:
-        return service.answer(request.query, ctx, request.corpus_id)
+        if request.resume:
+            # E-023 resume branch: re-authorize the earlier checkpoint against
+            # CURRENT state and continue. ``resume`` without ``run_id`` is a client
+            # error (fail closed — never synthesize from a non-existent checkpoint).
+            if request.run_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=_MSG_RESUME_BAD_REQUEST,
+                )
+            return service.resume_run(request.run_id, ctx)
+        return service.answer(request.query, ctx, request.corpus_id, run_id=request.run_id)
+    except ResumeAuthError as exc:
+        # A resume that cannot be re-authorized (foreign checkpoint, stale policy,
+        # undiscoverable corpus, or revoked evidence) is a NOT-FOUND at the API
+        # boundary — the client must not learn *why* (no internal detail leak).
+        logger.exception("Resume authorization failed for request %s", ctx.request_id)
+        raise HTTPException(
+            status_code=_STATUS_CHECKPOINT_NOT_FOUND,
+            detail=_MSG_INTERNAL_ERROR,
+        ) from exc
     except FastPathBackendError as exc:
         logger.exception("FastPath backend error for request %s", ctx.request_id)
         raise HTTPException(
@@ -61,6 +84,10 @@ def chat_v1(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=_MSG_INTERNAL_ERROR,
         ) from exc
+    except HTTPException:
+        # A handler-raised HTTPException (e.g. resume-without-run_id 400) is a
+        # deliberate client-facing status; re-raise it, never relabel as 500.
+        raise
     except Exception as exc:  # noqa: BLE001 - surface as 500; never mask as answer
         logger.exception("Unexpected error for request %s", ctx.request_id)
         raise HTTPException(

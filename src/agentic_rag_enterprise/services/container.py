@@ -187,6 +187,7 @@ class DefaultServiceContainer:
             model=self._model,
             resolve_corpus=self._resolver,
             top_k=settings.max_retrieval_top_k,
+            metadata_store=self._mstore,
         )
 
     def ingest(

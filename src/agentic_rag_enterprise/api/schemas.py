@@ -29,6 +29,14 @@ class ChatRequest(BaseModel):
 
     query: str
     corpus_id: str = "eng"
+    # E-023: resumable execution. ``run_id`` identifies a persisted
+    # ``run_checkpoints`` row; when ``resume`` is set, the handler calls
+    # ``service.resume_run(run_id, ctx)`` instead of ``service.answer(...)``.
+    # Neither field carries security context — identity is still injected from
+    # trusted headers (build plan §5.4). When ``resume`` is set, ``run_id`` is
+    # REQUIRED (the handler fails closed otherwise).
+    run_id: str | None = None
+    resume: bool = False
 
 
 # The response is exactly the validated E-013 AnswerEnvelope (FastAPI serializes
