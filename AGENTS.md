@@ -4,7 +4,7 @@
 `docs/agentic-rag-enterprise-build-plan.md`
 
 ## Current Milestone & Issue
-- Milestone: **M5** — Controlled Planner and dependent multi-hop (`E-017 -> E-018`)
+- Milestone: **M6** — Temporal scope, source authority & conflict (`E-021`)
 - Issue: **E-017** — Typed `QueryPlan` / `PlanStep` contract + DAG Validator — **CLOSED /
   ACCEPTED at `398f059`** (acceptance re-audit `33c...` passed: 10-check independent
   re-verification — schema invariants, DAG integrity for required+optional edges, binding
@@ -13,10 +13,12 @@
   re-audit also hardened `PlanViolation.detail` to `Field(exclude=True, repr=False)` so
   the unauthorized Corpus name cannot leak via `str()`/`repr()` into logs. Full contract
   at `docs/issue-e017-contract.md`.
-- Issue: **E-018** — Controlled Executor + dependent multi-hop — **contract amended
-  (P1-1..P1-5 + P2 + 6-item re-audit fix) / implementation still pending** (acceptance
-  of the amended `docs/issue-e018-contract.md` unlocks implementation). Consumes an accepted
-  `QueryPlan`: `StepResult` (frozen state machine:
+- Issue: **E-018** — Controlled Executor + dependent multi-hop — **CLOSED / ACCEPTED at
+  `4d072bd`** (the E-018 contract at `docs/issue-e018-contract.md` was accepted; the
+  executor, `StepResult` / `PlanExecutionResult`, `AtomicToolBudget`, `ToolRegistry`,
+  `RetrieverTool` and tests were implemented at `4d072bd` — "E-018: real RetrieverTool
+  two-hop + full regression pass" — on top of the amended contract `5d02d99` /
+  `2027102`). Consumes an accepted `QueryPlan`: `StepResult` (frozen state machine:
   pending/running/succeeded/failed/timed_out/skipped_dependency/budget_exhausted),
   parallel-ready scheduling in topological layers, required/optional dependency + binding
   semantics, per-step timeout, **atomic** shared Tool-Call budget (`AtomicToolBudget` with a
@@ -167,8 +169,20 @@
     `AnswerEnvelope.corpora_used` reflects only corpora that actually contributed Evidence.
     Full contract at `docs/issue-e016-contract.md`. Explicitly **excludes** Planner DAG,
     Required-Fact Judge, iteration, authority/freshness conflict arbitration, and
-    SQL/API/graph capability (those
+    SQL/API/graph capability (    those
     are M5 / E-017 → E-018).
+- **M5 / E-017 → E-018** — Controlled Planner and dependent multi-hop — **CLOSED**.
+  E-017 (Typed `QueryPlan` / `PlanStep` + DAG Validator) CLOSED / ACCEPTED at `398f059`.
+  E-018 (controlled Executor + `RetrieverTool` two-hop) implemented and **CLOSED / ACCEPTED
+  at `4d072bd`** ("E-018: real RetrieverTool two-hop + full regression pass") on top of the
+  amended `docs/issue-e018-contract.md` (`5d02d99` / `2027102`). Full Planner/DAG contract
+  at `docs/issue-e017-contract.md`; Executor contract at `docs/issue-e018-contract.md`.
+- **M6 / E-021** — Temporal scope, source authority & conflict — **contract frozen /
+  implementation pending** (this commit). Adds `TemporalScope`, a deterministic temporal
+  parser + filter, a `ConflictResolver` (five conflict types, four explicit auto-resolution
+  rules; unresolvable → `contradicted`), and the minimal `AnswerEnvelope.conflict_report`
+  extension, integrated into the post-retrieval evidence pipeline without changing the
+  Planner core. Full contract at `docs/issue-e021-contract.md`.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.
@@ -695,6 +709,25 @@ Controlled Executor + dependent multi-hop (build plan §13.4). Full contract at
   no infinite repair/retry; no Planner/Tool reading client-supplied tenant/role (only the
   Executor injects `SecurityContext`); no write operation (`sql`/`api`/`graph`); no dynamic
   step creation; no change to E-011→E-016 behaviour.
+
+## E-021 Allowed Changes (M6 only) — contract frozen / implementation pending
+Temporal scope, source authority & conflict (build plan §15 / Milestone 6). Full contract at
+`docs/issue-e021-contract.md`.
+- `docs/issue-e021-contract.md`, `AGENTS.md`.
+- **This commit is contract-only**: it freezes `TemporalScope`, the deterministic temporal
+  parser + filter, the `ConflictResolver` (five conflict types, four explicit auto-resolution
+  rules), the `ConflictReport` model, and the minimal `AnswerEnvelope.conflict_report`
+  extension. Implementation opens **after** acceptance.
+- **Reuse, no change:** `domain/evidence.py` (`Evidence` snapshot — all resolver fields already
+  present), `retrieval/retriever.py` (`SecureRetriever.retrieve_evidence` — authorized
+  collection only), `judge/models.py` (`SufficiencyResult`, `OverallStatus`, `FactCoverage`),
+  `answer/envelope.py` (`AnswerEnvelope`), `services/chat_service.py` (integration call
+  sites), `retrieval/fast_path.py`, `corpus/registry.py`, `domain/security.py`.
+- **Forbidden:** no change to `QueryPlan` / `PlanStep` / `executor.py` / `result.py` /
+  `budget.py` / `tool_registry.py` (Planner core stays frozen); no LLM time-reasoning / value-
+  extraction / NER in the resolver; no new `Evidence` field; no reliance on `retrieval_score` /
+  `rerank_score` to pick a winning fact; no change to E-011→E-020 behaviour beyond the agreed
+  `AnswerEnvelope.conflict_report` extension; no upstream modification.
 
 ## Standard Checks
 ```bash
