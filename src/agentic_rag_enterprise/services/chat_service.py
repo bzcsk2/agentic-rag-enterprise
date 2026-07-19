@@ -33,6 +33,14 @@ from agentic_rag_enterprise.corpus.router import CorpusRouter
 from agentic_rag_enterprise.domain.corpus import CorpusConfig
 from agentic_rag_enterprise.domain.evidence import Evidence as SnapshotEvidence
 from agentic_rag_enterprise.domain.security import SecurityContext
+from agentic_rag_enterprise.domain.temporal import parse_temporal_scope
+from agentic_rag_enterprise.evidence.conflict_resolver import ConflictResolver
+from agentic_rag_enterprise.evidence.models import (
+    ConflictReport,
+    ConflictStatus,
+    normalize_topic_key,
+)
+from agentic_rag_enterprise.evidence.temporal import filter_by_temporal_scope
 from agentic_rag_enterprise.judge.claim_evidence_verifier import (
     DeterministicClaimEvidenceVerifier,
 )
@@ -140,17 +148,61 @@ def _evidence_block(evidence: tuple[SnapshotEvidence, ...]) -> str:
     return "\n\n".join(parts)
 
 
-def _build_messages(query: str, evidence: tuple[SnapshotEvidence, ...]) -> list[dict[str, str]]:
+def _build_messages(
+    query: str,
+    evidence: tuple[SnapshotEvidence, ...],
+    *,
+    conflict_report: ConflictReport | None = None,
+) -> list[dict[str, str]]:
     """Build the synthesis prompt. Carries ONLY the query + evidence grounding.
 
     Security-context fields are deliberately absent — the model must never see
-    or produce tenant / identity / policy data (build plan §5.4).
+    or produce tenant / identity / policy data (build plan §5.4). When a
+    ``CONTRADICTED`` report is present, the model is instructed to present BOTH
+    conflicting sources with their applicable times and cite both ``evidence_id``s
+    — never pick a single answer (E-021 conflict rule).
     """
     user = f"Question:\n{query}\n\nAuthorized evidence:\n{_evidence_block(evidence)}"
+    if (
+        conflict_report is not None
+        and conflict_report.conflict_status == ConflictStatus.CONTRADICTED
+    ):
+        contradicts = []
+        for finding in conflict_report.findings:
+            if finding.resolvable:
+                continue
+            for src in finding.sources:
+                ef = src.effective_from.isoformat() if src.effective_from else "unknown"
+                et = src.effective_to.isoformat() if src.effective_to else "open-ended"
+                contradicts.append(
+                    f"- evidence {src.evidence_id} (doc {src.document_id} v{src.document_version}, "
+                    f"effective {ef} → {et})"
+                )
+        if contradicts:
+            user += (
+                "\n\nCONFLICT DETECTED — the evidence contradicts itself. Present BOTH "
+                "conflicting sources with their applicable effective times and cite BOTH "
+                "evidence ids. Do NOT pick a single answer.\n" + "\n".join(contradicts)
+            )
     return [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
+
+
+def _contradicted_coverage() -> SufficiencyResult:
+    """A resolver-forced coverage verdict (E-021 conflict rule, issue #2).
+
+    The resolver only emits ``conflict_status``; it never judges sufficiency. When
+    it reports ``CONTRADICTED`` the pipeline attaches this coverage so the envelope
+    completeness becomes ``conflicted``. The resolver never invents any other
+    sufficiency verdict.
+    """
+    return SufficiencyResult(
+        overall_status="contradicted",
+        should_abstain=False,
+        fact_coverage=(),
+    )
 
 
 class ChatService:
@@ -191,6 +243,27 @@ class ChatService:
         (including the ``insufficient`` → abstain short-circuit) is preserved.
         """
         return self.answer_with_iteration(query, ctx, corpus_id, max_rounds=1, judge=None)
+
+    def _run_conflict_stage(
+        self,
+        query: str,
+        evidence: tuple[SnapshotEvidence, ...],
+    ) -> tuple[ConflictReport, tuple[SnapshotEvidence, ...]]:
+        """Run the E-021 temporal filter + conflict resolver on post-retrieval evidence.
+
+        Parses the ``TemporalScope`` once, filters, then resolves. Returns the
+        resolver report and the surviving (kept) evidence in filter order — exactly
+        the set the synthesis step should consume. The resolver only ever sees the
+        already-authorized evidence it is handed (invariant 1).
+        """
+        scope = parse_temporal_scope(query)
+        filt = filter_by_temporal_scope(evidence, scope)
+        report = ConflictResolver().resolve(
+            filt.retained, scope, topic_key=normalize_topic_key(query)
+        )
+        kept = set(report.resolved_evidence_ids)
+        final_evidence = tuple(ev for ev in filt.retained if ev.evidence_id in kept)
+        return report, final_evidence
 
     def answer_multi_corpus(
         self,
@@ -294,12 +367,19 @@ class ChatService:
         limitations = _partial_retrieval_limitations(result.faults)
 
         # 3) Single-pass synthesis from the merged, verified claims.
+        report, final_evidence = self._run_conflict_stage(query, result.evidence)
+        coverage = None
+        if report.conflict_status == ConflictStatus.CONTRADICTED:
+            coverage = _contradicted_coverage()
         return self._synthesize_multi_corpus(
             query,
             ctx,
             result,
             partial_retrieval=partial_retrieval,
             limitations=limitations,
+            evidence=final_evidence,
+            coverage=coverage,
+            conflict_report=report,
         )
 
     def _retrieve_or_expand(
@@ -394,9 +474,13 @@ class ChatService:
         *,
         partial_retrieval: bool = False,
         limitations: tuple[str, ...] = (),
+        evidence: tuple[SnapshotEvidence, ...] | None = None,
+        coverage: SufficiencyResult | None = None,
+        conflict_report: ConflictReport | None = None,
     ) -> AnswerEnvelope:
         """Run LLM claim extraction over merged evidence, then build the envelope."""
-        messages = _build_messages(query, result.evidence)
+        synthesis_evidence = evidence if evidence is not None else result.evidence
+        messages = _build_messages(query, synthesis_evidence, conflict_report=conflict_report)
         try:
             extraction = cast(
                 ClaimExtraction,
@@ -410,15 +494,16 @@ class ChatService:
         return build_multi_corpus_envelope(
             ctx,
             query=query,
-            evidence=result.evidence,
+            evidence=synthesis_evidence,
             corpora_used=result.corpora_used,
             answer_markdown=extraction.draft_answer,
             claims=list(extraction.claims),
-            coverage=None,
+            coverage=coverage,
             tool_calls=result.retrieval_calls,
             limitations=limitations,
             partial_retrieval=partial_retrieval,
             stop_reason="evidence_found",
+            conflict_report=conflict_report,
         )
 
     def answer_with_iteration(
@@ -638,17 +723,22 @@ class ChatService:
                 break
 
         final_evidence = tuple(evidence_by_id.values())
+        report, final_evidence = self._run_conflict_stage(query, final_evidence)
+        coverage2 = coverage
+        if report.conflict_status == ConflictStatus.CONTRADICTED:
+            coverage2 = _contradicted_coverage()
         return self._synthesize(
             query,
             ctx,
             first_result,
-            coverage=coverage,
+            coverage=coverage2,
             verifier=verifier,
             evidence=final_evidence,
             gap_rounds=gap_rounds,
             iterations=gap_rounds,
             tool_calls=retrieval_calls,
             stop_reason=final_reason,
+            conflict_report=report,
         )
 
     def _run_single_pass(
@@ -681,7 +771,18 @@ class ChatService:
         if result.sufficiency is FastPathSufficiency.INSUFFICIENT:
             return conservative_refusal(result, ctx)
 
-        return self._synthesize(query, ctx, result)
+        report, final_evidence = self._run_conflict_stage(query, result.evidence)
+        coverage = None
+        if report.conflict_status == ConflictStatus.CONTRADICTED:
+            coverage = _contradicted_coverage()
+        return self._synthesize(
+            query,
+            ctx,
+            result,
+            evidence=final_evidence,
+            coverage=coverage,
+            conflict_report=report,
+        )
 
     def _synthesize(
         self,
@@ -696,6 +797,7 @@ class ChatService:
         iterations: int = 1,
         tool_calls: int = 1,
         stop_reason: str | None = None,
+        conflict_report: ConflictReport | None = None,
     ) -> AnswerEnvelope:
         """Run LLM claim extraction + Stage B verification, then build the envelope.
 
@@ -707,7 +809,7 @@ class ChatService:
         ``no_evidence`` and ignore it.
         """
         synthesis_evidence = evidence if evidence is not None else fast_path_result.evidence
-        messages = _build_messages(query, synthesis_evidence)
+        messages = _build_messages(query, synthesis_evidence, conflict_report=conflict_report)
         try:
             extraction = cast(
                 ClaimExtraction,
@@ -734,4 +836,5 @@ class ChatService:
             tool_calls=tool_calls,
             evidence=evidence,
             stop_reason=stop_reason,
+            conflict_report=conflict_report,
         )
