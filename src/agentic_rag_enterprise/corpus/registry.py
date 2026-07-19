@@ -40,6 +40,9 @@ class CorpusRegistry(Protocol):
     def resolve_candidates(
         self, query: str, security_context: SecurityContext, limit: int
     ) -> list[CorpusConfig]: ...
+    def resolve_collection_name(self, corpus_id: str) -> str: ...
+    def set_active_collection(self, corpus_id: str, collection_name: str) -> None: ...
+    def list_corpus_ids(self) -> list[str]: ...
 
 
 def _is_discoverable(corpus: CorpusConfig, ctx: SecurityContext) -> bool:
@@ -93,3 +96,30 @@ class InMemoryCorpusRegistry:
         if limit is not None and limit >= 0:
             candidates = candidates[:limit]
         return candidates
+
+    def resolve_collection_name(self, corpus_id: str) -> str:
+        """Control-plane active collection pointer for a corpus (build plan §10.8).
+
+        Returns ``CorpusConfig.vector_collection`` when set, else falls back to
+        ``corpus_id``. This is the name the hybrid retriever actually queries
+        (``hybrid.py``), so flipping it switches retrieval to a migrated index.
+        """
+        corpus = self._corpora.get(corpus_id)
+        if corpus is None:
+            return corpus_id
+        return corpus.vector_collection or corpus_id
+
+    def set_active_collection(self, corpus_id: str, collection_name: str) -> None:
+        """Flip the live active-collection pointer (index migration switch).
+
+        Updates the in-memory :class:`CorpusConfig` the retriever reads. The
+        persisted record is owned by ``MetadataStore.set_active_collection``;
+        index migration calls both so the switch survives a restart.
+        """
+        corpus = self._corpora.get(corpus_id)
+        if corpus is None:
+            return
+        self._corpora[corpus_id] = corpus.model_copy(update={"vector_collection": collection_name})
+
+    def list_corpus_ids(self) -> list[str]:
+        return list(self._corpora.keys())

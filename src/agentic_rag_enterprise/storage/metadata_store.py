@@ -15,7 +15,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -1234,6 +1234,304 @@ class MetadataStore:
             "DELETE FROM documents WHERE tenant_id=? AND corpus_id=? AND document_id=?",
             (tenant_id, corpus_id, document_id),
         )
+
+    # ------------------------------------------------------------------ #
+    # E-022: reconciler + index migration + rollback
+    # ------------------------------------------------------------------ #
+    def acquire_reconciler_lease(self, corpus_id: str, owner: str, ttl_seconds: int = 300) -> bool:
+        """Fence reconciler runs to a single active owner per corpus.
+
+        Returns ``True`` if this ``owner`` now holds the lease (no live lease, an
+        expired lease, or it already owns it). Returns ``False`` if another owner
+        holds a live lease. Enables safe concurrent / repeated reconciliation
+        (build plan §10.10 + E-022 contract invariants #5).
+        """
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=ttl_seconds)
+        row = self._conn.execute(
+            "SELECT owner, expires_at FROM reconciler_leases WHERE corpus_id=?",
+            (corpus_id,),
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO reconciler_leases(corpus_id, owner, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (corpus_id, owner, now.isoformat(), expires.isoformat()),
+            )
+            return True
+        lease_expires = datetime.fromisoformat(row["expires_at"])
+        if lease_expires <= now or row["owner"] == owner:
+            self._conn.execute(
+                "UPDATE reconciler_leases SET owner=?, acquired_at=?, expires_at=? "
+                "WHERE corpus_id=?",
+                (owner, now.isoformat(), expires.isoformat(), corpus_id),
+            )
+            return True
+        return False
+
+    def release_reconciler_lease(self, corpus_id: str, owner: str) -> None:
+        self._conn.execute(
+            "DELETE FROM reconciler_leases WHERE corpus_id=? AND owner=?",
+            (corpus_id, owner),
+        )
+
+    def begin_reconciliation_run(
+        self, run_id: str, corpus_id: str, started_at: str, *, dry_run: bool = False
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO reconciliation_runs(run_id, corpus_id, started_at, dry_run) "
+            "VALUES (?, ?, ?, ?)",
+            (run_id, corpus_id, started_at, int(dry_run)),
+        )
+
+    def finish_reconciliation_run(
+        self, run_id: str, finished_at: str, finding_count: int, *, mutated: bool = False
+    ) -> None:
+        self._conn.execute(
+            "UPDATE reconciliation_runs SET finished_at=?, finding_count=?, mutated=? "
+            "WHERE run_id=?",
+            (finished_at, finding_count, int(mutated), run_id),
+        )
+
+    def record_reconciliation_finding(
+        self,
+        run_id: str,
+        *,
+        kind: str,
+        corpus_id: str,
+        tenant_id: Optional[str] = None,
+        document_id: Optional[str] = None,
+        document_version: Optional[str] = None,
+        detail: str = "",
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO reconciliation_findings(run_id, kind, corpus_id, tenant_id, "
+            "document_id, document_version, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_id, kind, corpus_id, tenant_id, document_id, document_version, detail),
+        )
+
+    def iter_active_document_versions(self, corpus_id: str) -> list[tuple[str, str, str]]:
+        """Return ``(tenant_id, document_id, version)`` for every ``active`` row.
+
+        This is the reconciler's truth set: the data planes (Qdrant / Parent
+        Store) are expected to contain exactly these artifacts. The tenant is
+        included so the reconciler can scope data-plane lookups without a
+        separate corpus-wide tenant lookup.
+        """
+        rows = self._conn.execute(
+            "SELECT tenant_id, document_id, version FROM documents "
+            "WHERE corpus_id=? AND status='active'",
+            (corpus_id,),
+        ).fetchall()
+        return [(r["tenant_id"], r["document_id"], r["version"]) for r in rows]
+
+    def iter_known_document_versions(self, corpus_id: str) -> list[tuple[str, str, str]]:
+        """Return every ``(tenant_id, document_id, version)`` row (any status).
+
+        The reconciler treats a Qdrant point / parent as a genuine orphan only
+        when its ``(tenant_id, document_id, document_version)`` is absent from
+        this set — a row that exists (even ``deleted``) is a known lifecycle
+        state, handled by the purge path rather than force-deletion.
+        """
+        rows = self._conn.execute(
+            "SELECT tenant_id, document_id, version FROM documents WHERE corpus_id=?",
+            (corpus_id,),
+        ).fetchall()
+        return [(r["tenant_id"], r["document_id"], r["version"]) for r in rows]
+
+    def iter_deleted_document_ids(self, corpus_id: str) -> list[tuple[str, str, str]]:
+        """Return ``(tenant_id, document_id, version)`` rows in ``deleted`` status.
+
+        The reconciler drives physical purge for these when their data plane
+        still lingers (post-commit cleanup retry, build plan §10.10 #6).
+        """
+        rows = self._conn.execute(
+            "SELECT tenant_id, document_id, version FROM documents "
+            "WHERE corpus_id=? AND status='deleted'",
+            (corpus_id,),
+        ).fetchall()
+        return [(r["tenant_id"], r["document_id"], r["version"]) for r in rows]
+
+    def get_corpus_tenant(self, corpus_id: str) -> Optional[str]:
+        """Tenant that owns a corpus (corpora are tenant-scoped)."""
+        row = self._conn.execute(
+            "SELECT tenant_id FROM documents WHERE corpus_id=? LIMIT 1",
+            (corpus_id,),
+        ).fetchone()
+        if row:
+            return row["tenant_id"]
+        reg = self._conn.execute(
+            "SELECT tenant_id FROM corpus_registry WHERE corpus_id=? LIMIT 1",
+            (corpus_id,),
+        ).fetchone()
+        return reg["tenant_id"] if reg else None
+
+    def iter_failed_job_ids(self, corpus_id: str) -> list[str]:
+        """Return ``failed`` ingestion-job ids for a corpus (dead-letter)."""
+        rows = self._conn.execute(
+            "SELECT job_id FROM ingestion_jobs WHERE corpus_id=? AND status='failed'",
+            (corpus_id,),
+        ).fetchall()
+        return [r["job_id"] for r in rows]
+
+    def iter_child_chunks(self, corpus_id: str) -> list[dict]:
+        """Return child-chunk control-plane records for re-embedding into a new index.
+
+        Used by index migration to rebuild a parallel ``v2`` collection from the
+        existing chunk content + ACL (no re-parsing). Payload fields mirror the
+        Qdrant point schema written by :func:`child_chunk_to_point`.
+        """
+        rows = self._conn.execute(
+            "SELECT chunk_id, parent_id, tenant_id, corpus_id, document_id, "
+            "document_version, section_path, content, security_level, acl_scope, "
+            "allowed_user_ids, allowed_group_ids, denied_user_ids, denied_group_ids "
+            "FROM chunks WHERE corpus_id=? AND chunk_type='child'",
+            (corpus_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_active_collection(self, corpus_id: str) -> Optional[str]:
+        """Persisted active collection name (None => falls back to ``corpus_id``)."""
+        row = self._conn.execute(
+            "SELECT vector_collection FROM corpus_registry WHERE corpus_id=?",
+            (corpus_id,),
+        ).fetchone()
+        return row["vector_collection"] if row else None
+
+    def set_active_collection(self, corpus_id: str, collection_name: str) -> None:
+        """Persist the active collection pointer (build plan §10.8 switch)."""
+        self._conn.execute(
+            "UPDATE corpus_registry SET vector_collection=? WHERE corpus_id=?",
+            (collection_name, corpus_id),
+        )
+
+    def begin_index_build(
+        self,
+        build_id: str,
+        corpus_id: str,
+        collection_name: str,
+        embedding_version: str,
+        chunking_version: str,
+        previous_collection: Optional[str],
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO index_builds(build_id, corpus_id, collection_name, "
+            "embedding_version, chunking_version, status, previous_collection, started_at) "
+            "VALUES (?, ?, ?, ?, ?, 'building', ?, ?)",
+            (
+                build_id,
+                corpus_id,
+                collection_name,
+                embedding_version,
+                chunking_version,
+                previous_collection,
+                _now_iso(),
+            ),
+        )
+
+    def complete_index_build(self, build_id: str) -> None:
+        self._conn.execute(
+            "UPDATE index_builds SET status='active', finished_at=? WHERE build_id=?",
+            (_now_iso(), build_id),
+        )
+
+    def get_index_build(self, build_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM index_builds WHERE build_id=?", (build_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def rollback_active_version(
+        self,
+        *,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        to_version: Optional[str] = None,
+        expected_revision: Optional[int] = None,
+    ) -> tuple[int, Optional[str]]:
+        """Temporarily roll a document's active version back (build plan §2630).
+
+        The target version must still exist and must NOT be ``deleted`` (a purged
+        version can never be reactivated). The switch is CAS-guarded on the
+        monotonic ``lifecycle_revision`` (§10.10 #8) so a stale attempt cannot
+        overwrite a newer committed revision. Returns ``(new_revision,
+        previous_active_version)``. Raises :class:`ActiveVersionConflict` if there
+        is no active version to roll back, no eligible candidate, or the CAS loses.
+        """
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            rev_row = cur.execute(
+                "SELECT MAX(lifecycle_revision) AS m FROM documents "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=?",
+                (tenant_id, corpus_id, document_id),
+            ).fetchone()
+            current_rev = int(rev_row["m"]) if rev_row and rev_row["m"] is not None else 0
+            active_row = cur.execute(
+                "SELECT version FROM documents "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND status='active'",
+                (tenant_id, corpus_id, document_id),
+            ).fetchone()
+            if active_row is None:
+                raise ActiveVersionConflict(
+                    f"no active version to roll back for document {document_id!r}"
+                )
+            previous_version = active_row["version"]
+            # Resolve the rollback target.
+            if to_version is not None:
+                target = to_version
+            else:
+                cand = cur.execute(
+                    "SELECT version FROM documents "
+                    "WHERE tenant_id=? AND corpus_id=? AND document_id=? "
+                    "AND status <> 'active' AND status <> 'deleted' "
+                    "ORDER BY lifecycle_revision DESC LIMIT 1",
+                    (tenant_id, corpus_id, document_id),
+                ).fetchone()
+                if cand is None:
+                    raise ActiveVersionConflict(
+                        f"no eligible rollback candidate for document {document_id!r}"
+                    )
+                target = cand["version"]
+            target_row = cur.execute(
+                "SELECT status FROM documents "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=?",
+                (tenant_id, corpus_id, document_id, target),
+            ).fetchone()
+            if target_row is None:
+                raise ActiveVersionConflict(f"rollback target version {target!r} not found")
+            if target_row["status"] == "deleted":
+                raise ActiveVersionConflict(f"refuse to reactivate purged version {target!r}")
+            # Idempotent: target already active.
+            if target == previous_version:
+                cur.execute("COMMIT")
+                return current_rev, previous_version
+            if expected_revision is not None and current_rev != expected_revision:
+                raise ActiveVersionConflict(
+                    f"stale expected_revision={expected_revision}, current={current_rev}"
+                )
+            new_rev = current_rev + 1
+            now = _now_iso()
+            cur.execute(
+                "UPDATE documents SET status='deprecated', deprecated=1, "
+                "effective_to=?, lifecycle_revision=? WHERE tenant_id=? AND "
+                "corpus_id=? AND document_id=? AND version=?",
+                (now, new_rev, tenant_id, corpus_id, document_id, previous_version),
+            )
+            cur.execute(
+                "UPDATE documents SET status='active', deprecated=0, "
+                "effective_from=?, indexed_at=?, lifecycle_revision=? "
+                "WHERE tenant_id=? AND corpus_id=? AND document_id=? AND version=?",
+                (now, now, new_rev, tenant_id, corpus_id, document_id, target),
+            )
+            if cur.rowcount == 0:
+                raise ActiveVersionConflict(f"rollback target {target!r} vanished during switch")
+            cur.execute("COMMIT")
+            return new_rev, previous_version
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
 
     # ------------------------------------------------------------------ #
     # Row <-> model mapping

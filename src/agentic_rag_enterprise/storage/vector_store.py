@@ -193,6 +193,37 @@ class VectorStore:
         )
         return response.points
 
+    def collection_exists(self, name: str) -> bool:
+        """Whether a collection (by name) currently exists in Qdrant."""
+        return self._client.collection_exists(name)
+
+    def list_collections(self) -> list[str]:
+        """Names of all collections currently present in Qdrant."""
+        collections = self._client.get_collections().collections
+        return [c.name for c in collections]
+
+    def scroll_all(self, name: str, batch: int = 256) -> list[tuple[str, dict]]:
+        """Return every ``(point_id, payload)`` in a collection.
+
+        Used by the reconciler to compare the Qdrant data plane against the
+        Metadata DB truth set. ``with_vectors=False`` keeps payloads cheap.
+        """
+        out: list[tuple[str, dict]] = []
+        offset: object = None
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=name,
+                with_payload=True,
+                with_vectors=False,
+                limit=batch,
+                offset=offset,  # type: ignore[arg-type]
+            )
+            for p in points:
+                out.append((str(p.id), p.payload or {}))
+            if offset is None:
+                break
+        return out
+
     def close(self) -> None:
         self._client.close()
 

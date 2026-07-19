@@ -122,3 +122,44 @@ class ParentStore:
 
     def __contains__(self, parent_id: str) -> bool:
         return parent_id in self._store
+
+    def list_parent_ids(
+        self,
+        tenant_id: str,
+        corpus_id: str,
+        document_id: str,
+        document_version: str,
+    ) -> list[str]:
+        """Return every parent id for one (tenant, corpus, document, version).
+
+        Scoped by ``tenant_id`` + ``corpus_id`` (build plan §10.6). Used by the
+        reconciler to detect missing / orphaned parent data planes.
+        """
+        return [
+            chunk.parent_id
+            for chunk in self._store.values()
+            if (
+                chunk.tenant_id == tenant_id
+                and chunk.corpus_id == corpus_id
+                and chunk.document_id == document_id
+                and chunk.document_version == document_version
+            )
+        ]
+
+    def iter_all_parents(self) -> list[tuple[str, str, str, str, str]]:
+        """Return ``(parent_id, tenant_id, corpus_id, document_id, document_version)``.
+
+        Used by the reconciler to detect orphaned parent chunks whose
+        ``(document_id, document_version)`` is absent from the Metadata DB truth
+        set.
+        """
+        return [
+            (
+                chunk.parent_id,
+                chunk.tenant_id,
+                chunk.corpus_id,
+                chunk.document_id,
+                chunk.document_version,
+            )
+            for chunk in self._store.values()
+        ]
