@@ -56,6 +56,7 @@ from agentic_rag_enterprise.services.container import (
 from agentic_rag_enterprise.storage.checkpoint_store import (
     CHECKPOINT_RUNNING,
     CheckpointIdentityConflict,
+    ResumeAuthError,
     RunCheckpoint,
 )
 from agentic_rag_enterprise.storage.vector_store import DenseEncoder, SparseEncoder
@@ -987,3 +988,57 @@ def test_completed_checkpoint_flips_to_running_on_evidence_revocation() -> None:
     assert {e.evidence_id for e in resumed.evidence} == {"e1"}
     # Final status is completed (the loop+mark_done re-completed it).
     assert mstore.load_run_checkpoint("FLIP-RUN").status == "completed"
+
+
+# --------------------------------------------------------------------------- #
+# E-023 P1-3 residual: an `aborted` checkpoint MUST NOT be resumable
+# (build plan §3623 — a cancelled run must never re-enter the loop). The
+# resume gate raises ResumeAuthError("checkpoint_aborted") fail-closed.
+# --------------------------------------------------------------------------- #
+def test_aborted_checkpoint_is_not_resumable() -> None:
+    container = get_default_container()
+    _ingest(container, "d1", "The vacation policy grants 20 days paid leave.")
+    mstore = container.metadata_store
+
+    ev = _evidence("e1", "Vacation policy text", "d1")
+    ck = RunCheckpoint(
+        run_id="ABORT-1",
+        tenant_id="t1",
+        user_id="u1",
+        session_id="s1",
+        policy_version="1.0",
+        query="q",
+        corpus_id="eng",
+        max_rounds=5,
+        required_facts=_facts("vacation policy"),
+        round_index=1,
+        evidence=(ev,),
+        prior_queries=["q"],
+        seen_text_hashes=[ev.text_hash],
+        seen_doc_versions=[(ev.document_id, ev.document_version)],
+        retrieval_calls=1,
+        gap_rounds=1,
+        final_reason="sufficient",
+        conflict_stop=False,
+        coverage=None,
+        final_report=None,
+        final_evidence_ids=["e1"],
+        first_result=FastPathResult(
+            query="q",
+            corpus_id="eng",
+            tenant_id="t1",
+            evidence=(ev,),
+            sufficiency=FastPathSufficiency.SUFFICIENT,
+            stop_reason=FastPathStopReason.EVIDENCE_FOUND,
+        ),
+    )
+    mstore.save_run_checkpoint(ck)
+    # A cancellation (E-024 will own the public API) marks the row aborted.
+    mstore.mark_run_checkpoint_done("ABORT-1", aborted=True)
+    assert mstore.load_run_checkpoint("ABORT-1").status == "aborted"
+
+    # Resume MUST be refused — the run was explicitly cancelled. A fault service
+    # proves no Retriever/Judge/Model is even reached on the abort path.
+    svc = _fault_service(container)
+    with pytest.raises(ResumeAuthError):
+        svc.resume_run("ABORT-1", _ctx())
