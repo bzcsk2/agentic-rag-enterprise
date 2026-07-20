@@ -236,7 +236,23 @@
   enabled+searchable corpus's active collection. No E-024 source is implemented until the
   remediated contract is accepted. README's "Internal / Research MVP" and "/health"
   claims were corrected to "Internal MVP / pre-Research-MVP" and "basic /health exists".
-  Full (remediated) contract at `docs/issue-e024-contract.md`.
+  Full (remediated)   contract at `docs/issue-e024-contract.md`. The remediated contract (`8ca42b9`) was
+  returned FAIL again on five R2-P1 gaps (R2-P1-1 pre-round-0 recovery state machine;
+  R2-P1-2 contradictory round-0 cancel call-counts; R2-P1-3 only one-sided CAS; R2-P1-4
+  no cross-file consistency barrier / no Evidence schema version; R2-P1-5 contradictory
+  readiness rules) plus P2 file-landing gaps. A second remediation (this commit) freezes:
+  the exhaustive `first_result=None` recovery table (`aborted`→refuse by status first,
+  `running`→restart round 0, `completed`→corrupt/fail-closed); the split Scenario A
+  (0 calls) / Scenario B (1 in-flight Retriever returned+discarded, `tool_calls` truthful)
+  round-0 cancellation; **bidirectional** CAS (`complete_run_checkpoint` with
+  `WHERE status='running'` replacing the unconditional `mark_run_checkpoint_done`, plus
+  `cancel_run_checkpoint`); a `BackupCoordinator` cross-file write barrier + `snapshot_epoch`
+  + `EVIDENCE_SCHEMA_VERSION`/fingerprint; a single non-contradictory readiness rule
+  (registry-read-fail→503 / empty-profile→ready / each profile corpus needs non-empty
+  pointer + existing collection→else 503); and the P2 landing zones (`config.py`
+  `evidence_db_path`, `.env.example`, `operations/__init__.py`, `operations/restore.py`,
+  `storage/evidence_store.py`). No E-024 source is implemented until the remediated
+  contract is accepted.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.

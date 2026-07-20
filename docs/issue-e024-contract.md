@@ -62,9 +62,11 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
     Qdrant / Metadata DB / model availability, so a transient dependency fault never
     kills liveness.
   - `GET /ready` (readiness): answers "can this instance safely take prod traffic?"
-    Checks (each with a strict timeout): applied migrations, Metadata DB reachable,
-    Corpus Registry loaded, at least one active collection present, required local
-    dependencies present. Any failure → **503** with a fixed, generic body.
+    Checks (each with a strict timeout; ANY failure → **503** with a fixed, generic body,
+    see the frozen readiness rule in §1-E): applied migrations, Metadata DB reachable,
+    Evidence Snapshot Store reachable, Corpus Registry loadable, every corpus in the
+    release reference profile resolved to a live collection, required local dependencies
+    present.
   - readiness **never** calls the LLM and **never** performs a business-side repair;
     the `Reconciler` is the repair tool, readiness is a diagnostic gate only.
   - Strict per-check timeouts; a dependency exception → 503; the client sees only
@@ -94,6 +96,29 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
     preemption); no NEW Retriever / Judge / Model call is issued after cancel is observed.
   - `aborted` survives restart (it is a persisted row status) and `aborted` checkpoints
     are NOT resumable (E-023 already refuses `aborted` in `resume_run`).
+  - **Pre-round-0 recovery state machine (R2-P1-1, FROZEN):** `resume_run` MUST branch on
+    the persisted `status` **FIRST**, and only NARROW `first_result` requirements for
+    states that need finalization. The pre-round-0 checkpoint (`first_result=None`,
+    `round_index=0`, empty evidence) introduces three additional (status × first_result)
+    combinations. The complete, exhaustive table:
+    - `aborted` + `first_result=None` → refuse **by status first** with
+      `ResumeAuthError("checkpoint_aborted")` (NEVER an `AssertionError`); the
+      `first_result` being `None` is irrelevant once status is `aborted`.
+    - `running` + `first_result=None` → after the standard identity / `policy_version` /
+      corpus-discoverability re-auth, **restart from round 0** (re-run `run_fast_path`,
+      then continue the normal loop). This is the "crashed before round-0 retrieval"
+      recovery. No `AssertionError` is allowed.
+    - `completed` + `first_result=None` → **corrupt / illegal state** (a completed run must
+      always have a `first_result`). Fail closed: `ResumeAuthError` (or treat as broken,
+      like `load_run_checkpoint`'s corruption guard) — do NOT enter Retriever / Judge /
+      Model.
+    - `aborted` + `first_result` set → refuse with `ResumeAuthError("checkpoint_aborted")`
+      (unchanged E-023 behavior).
+    - `running` + `first_result` set → normal resume from `round_index` (E-023 behavior).
+    - `completed` + `first_result` set → idempotent finalize (E-023 behavior).
+    The acceptance matrix MUST cover the first three (pre-round-0) combinations with
+    explicit tests, asserting `resume_run` raises `ResumeAuthError` (aborted/completed) or
+    re-runs round 0 (running) WITHOUT ever hitting an `AssertionError`.
 - **C. Backup / Restore** (local MVP, no cloud / no Postgres / no Qdrant Server):
   - **Backup sources of truth = BOTH control-plane SQLite files** (P1-1): the Metadata
     DB (`metadata.db`) AND the Evidence Snapshot Store (`evidence.db`). Qdrant collection(s)
@@ -102,9 +127,32 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
   - Backup = consistent SQLite snapshot of EACH control-plane file (SQLite backup API or
     equivalent) taken while honoring active writers; never a raw `cp` of a live, open
     DB file.
-  - Backup artifact carries a **versioned manifest** (format version, per-file
-    {path, sha256, migration list, timestamp}, corpus/collection pointers). The manifest
-    lists exactly the files captured so restore can verify each one.
+  - **Cross-file consistency barrier (R2-P1-4, FROZEN):** the two control-plane DBs are
+    snapshotted under a single coordinated barrier so the backup reflects one logical
+    epoch, NOT two independently-timed consistent files. The `BackupCoordinator`:
+    1. acquires a global write barrier on BOTH `MetadataStore` and `EvidenceSnapshotStore`
+       (e.g. a briefly-held exclusive lock / `BEGIN IMMEDIATE` on each, or an explicit
+       offline/quiesced backup for the Internal MVP — the contract permits the quiesced
+       mode);
+    2. records a single `snapshot_epoch` (monotonic timestamp/seq) shared by both files;
+    3. performs the SQLite backup of each file;
+    4. computes per-file sha256 and writes the manifest;
+    5. releases the barrier.
+    Under concurrent retrieval/audit writes, the barrier guarantees metadata.db and
+    evidence.db are at the same `snapshot_epoch` (not metadata@T2 + evidence@T1).
+  - **Evidence schema version (R2-P1-4):** the Evidence Snapshot Store currently creates
+    its schema with inline `CREATE TABLE IF NOT EXISTS` and has no `schema_migrations`
+    table. The contract freezes ONE of the following (implementer picks, all acceptable):
+    - a module-level `EVIDENCE_SCHEMA_VERSION` constant written into the manifest, OR
+    - an `evidence_schema_version` table the store maintains, OR
+    - a structural fingerprint (sorted `CREATE TABLE` DDL hash) recorded in the manifest.
+    The manifest's per-file entry for the Evidence DB MUST carry this version/fingerprint
+    (not a "migration list" that does not exist). `storage/evidence_store.py` is added to
+    the allowed-paths list so it can expose a safe backup lock, its schema version, and a
+    backup primitive.
+  - Backup artifact carries a **versioned manifest** (format version, `snapshot_epoch`,
+    per-file {path, sha256, schema_version_or_fingerprint, timestamp}, corpus/collection
+    pointers). The manifest lists exactly the files captured so restore can verify each one.
   - **Restore**: verify manifest/checksum/format/compatibility for EVERY listed file
     FIRST; on failure, leave the current runnable DBs untouched. Before replacing, take
     a pre-restore backup of each target file (or require an explicit offline atomic swap).
@@ -184,22 +232,31 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
   on ANY check failure. Body is fixed + generic; the HTTP status is the only signal.
   Registered via the same `api/routes/health.py` module (so a single router owns the
   health surface and double-registration is impossible).
+- **Frozen readiness rule (R2-P1-5 — single, non-contradictory):** there is exactly
+  ONE readiness decision, stated here and nowhere else in this contract. Delete any
+  other phrasing ("at least one active collection", "registry must be non-empty",
+  "whose pointer is set").
+  1. Corpus Registry read FAILS (exception) → **503**.
+  2. Corpus Registry read SUCCEEDS and the **release reference profile is empty** (no
+     `enabled`+`searchable` corpus required) → **ready** (200). This is the only path by
+     which an "empty" instance is `ready`; it is driven by the profile being empty, NOT
+     by "registry empty" or "zero collections".
+  3. For **EACH** corpus in the release reference profile (the set of `enabled`+
+     `searchable` corpora that MUST be live for this instance; for the Internal MVP that
+     set = all currently registered `enabled`+`searchable` corpora), BOTH must hold or
+     the instance is **unavailable** (503):
+     - the corpus's `active_collection` pointer is NON-EMPTY (a missing pointer is itself
+       a failure, not a skip); AND
+     - the pointer resolves to an **actually-existing** Qdrant collection.
 - Check order (each wrapped in a timeout, any exception → 503):
   1. migrations applied (`schema_migrations` has the expected max version) on the
      Metadata DB;
   2. Metadata DB reachable (a trivial read inside the timeout);
   3. Evidence Snapshot Store reachable (a trivial read on `evidence.db`) — it is a
      backup source of truth and must be intact for replay/audit (P1-1);
-  4. Corpus Registry non-empty / loadable;
-  5. **every** `enabled` + `searchable` corpus whose `active_collection` pointer is set
-     MUST resolve to an actually-existing Qdrant collection (P1-6 — NOT "at least one";
-     a missing collection for a discoverable corpus fails readiness). An **empty** DB
-     with no enabled/searchable corpora registered returns `ready` (the default container
-     creates collections lazily on ingest, so a fresh instance must not be marked
-     unavailable solely for having zero collections yet). The exact behavior is pinned by
-     a release reference profile constant (the set of corpora that MUST have a collection
-     for the instance to be `ready`); for the Internal MVP that set = all currently
-     registered `enabled`+`searchable` corpora.
+  4. Corpus Registry loadable (read success/failure per rule step 1 above);
+  5. every corpus in the release reference profile has a non-empty `active_collection`
+     pointer resolving to an existing Qdrant collection (rule step 3);
   6. required local dependencies (encoders/model) importable.
 
 ### Cancellation API (P1-4 — FROZEN, not optional)
@@ -226,16 +283,22 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
   the model.
 
 ### Backup / restore (CLI, not HTTP)
-- `python -m agentic_rag_enterprise.operations.backup --metadata-db <path>
-  --evidence-db <path> --out <dir>` → for EACH control-plane DB, writes a consistent
-  snapshot (`<dir>/metadata-<ts>.db`, `<dir>/evidence-<ts>.db`) + `<dir>/manifest.json`
-  (format version, per-file {path, sha256, migration list, timestamp}, corpus/collection
-  pointers).
-- `python -m agentic_rag_enterprise.operations.restore --in <dir> --metadata-db <target>
-  --evidence-db <target-evidence>` → verifies manifest/checksum/format for EVERY listed
-  file; refuses on any mismatch; takes a pre-restore backup of each target; swaps
-  atomically (or requires offline swap); applies migrations; runs the `Reconciler`;
-  verifies readiness. On any verification failure, leaves the live DBs untouched.
+- Unified command: `python -m agentic_rag_enterprise.operations.backup
+  {backup|restore}` (subcommand form; `operations/__init__.py` + `operations/backup.py`
+  + `operations/restore.py` are the landing zones). Both subcommands read DB paths from
+  `settings.metadata_db_path` / `settings.evidence_db_path` unless overridden by flags.
+- `... backup --out <dir>` → the `BackupCoordinator` acquires the cross-file write
+  barrier, records `snapshot_epoch`, snapshots BOTH control-plane DBs
+  (`<dir>/metadata-<ts>.db`, `<dir>/evidence-<ts>.db`), computes per-file sha256 + the
+  Evidence schema version/fingerprint, and writes `<dir>/manifest.json` (format version,
+  `snapshot_epoch`, per-file {path, sha256, schema_version_or_fingerprint, timestamp},
+  corpus/collection pointers). Then releases the barrier.
+- `... restore --in <dir> --metadata-db <target> --evidence-db <target-evidence>` →
+  verifies manifest/checksum/`snapshot_epoch`/format for EVERY listed file (incl. the
+  Evidence schema version/fingerprint); refuses on any mismatch; takes a pre-restore
+  backup of each target; swaps atomically (or requires offline swap); applies migrations;
+  runs the `Reconciler`; verifies readiness. On any verification failure, leaves the live
+  DBs untouched.
 
 ---
 
@@ -260,18 +323,30 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
 
 - **No new Metadata DB migration required** for E-024: it reuses the E-023
   `run_checkpoints` `status` column (`aborted` already exists and `resume_run` already
-  refuses it). The cancellation CAS is a NEW METHOD on `metadata_store.py`
-  (`cancel_run_checkpoint`) — P1-3 — implemented inside one `BEGIN IMMEDIATE`
-  transaction, never a standalone `UPDATE`:
-  - reads the row's current `status` + identity binding;
-  - if identity mismatch → raise `CheckpointIdentityConflict` (fail closed);
-  - if `status == completed` → return `already_completed` (no flip, idempotent 200);
-  - if `status == aborted` → return `already_aborted` (idempotent 200);
-  - if `status == running` → flip to `aborted` and return `running_to_aborted`.
-  This is the ONLY writer of the `aborted` transition and makes complete/cancel
-  race-safe: `mark_run_checkpoint_done` (complete) and `cancel_run_checkpoint` (abort)
-  both run under `BEGIN IMMEDIATE`, so exactly one terminal status wins; a concurrent
-  complete+abort yields a single legal value, never both.
+  refuses it). **Both** terminal transitions become transactional CAS methods on
+  `metadata_store.py`, each inside one `BEGIN IMMEDIATE` transaction (R2-P1-3 — the race
+  is bidirectional; freezing only the cancel side is insufficient):
+  - `cancel_run_checkpoint(run_id, tenant_id, user_id, session_id, policy_version)`:
+    - reads the row's current `status` + identity binding;
+    - identity mismatch → raise `CheckpointIdentityConflict` (fail closed);
+    - `completed` → return `already_completed` (no flip, idempotent 200);
+    - `aborted` → return `already_aborted` (idempotent 200);
+    - `running` → flip to `aborted` via `UPDATE ... SET status='aborted' WHERE run_id=?
+      AND status='running'` and return `running_to_aborted`.
+  - `complete_run_checkpoint(run_id)` (REPLACES the current unconditional
+    `mark_run_checkpoint_done` UPDATE — the old method is removed/renamed so no code path
+    can flip `aborted → completed`):
+    - `running` → `completed` via `UPDATE ... SET status='completed' WHERE run_id=? AND
+      status='running'` (return `running_to_completed`);
+    - `completed` → `already_completed`;
+    - `aborted` → `already_aborted` (a cancelled run is NOT silently completed);
+    - missing → `not_found`.
+  Because BOTH use `WHERE status='running'` guards inside `BEGIN IMMEDIATE`, the
+  interleaving `cancel → aborted` then stale `complete` is a no-op (the `WHERE` matches
+  nothing), and `complete → completed` then stale `cancel` is likewise a no-op. Exactly
+  one terminal status survives; never both. **ALL** iteration terminal paths
+  (`answer_with_iteration` end-of-loop, `_BreakLoop` handlers, resume terminal paths)
+  MUST call `complete_run_checkpoint`, never a raw `UPDATE`.
 - Readiness is read-only — no migration. Evidence Snapshot Store uses its own existing
   `apply_migrations` (no new migration needed for backup, since restore re-applies it).
 - Backup/restore operates on the existing Metadata DB + Evidence DB files + manifest;
@@ -293,27 +368,51 @@ Therefore the backup scope MUST cover both DB files (see §1-C). A single-file
 
 ### Cancellation
 - same principal can cancel a `running` run → `aborted`.
-- **round-0 cancellation:** a client cancels while the round-0 `run_fast_path` Retriever
-  is blocking (checkpoint was created pre-round-0 with `first_result=None`); the run
-  transitions to `aborted` and finalizes a conservative refusal with ZERO retrieval/judge/
-  model calls (integration test with a blocking round-0 Retriever + concurrent cancel).
+- **Round-0 cancellation — TWO distinct scenarios (R2-P1-2, MUST be split):**
+  - **Scenario A (cancel BEFORE the round-0 pre-call check):** the run is cancelled before
+    the loop's cooperative check fires (pre-round-0 checkpoint already `aborted`). On
+    resume/continue the loop issues **0 Retriever / 0 Judge / 0 Model** calls and
+    finalizes a conservative refusal (`tool_calls=0`).
+  - **Scenario B (cancel AFTER the round-0 Retriever is already entered & blocking):** the
+    in-flight synchronous Retriever call is allowed to RETURN (cooperative cancellation
+    never hard-kills an entered call); its result is **discarded**; the loop then issues
+    **0 additional Retriever / 0 Judge / 0 Model** calls and keeps `status=aborted`. The
+    returned `AnswerEnvelope.tool_calls` MUST truthfully record the 1 already-executed
+    retrieval (NOT 0) — the count reflects reality, not the post-cancel ideal.
+  Both scenarios are covered by integration tests (blocking round-0 Retriever + concurrent
+  cancel, plus a cancel-before-check variant).
 - foreign principal cannot cancel → refused (generic 404, reason hidden).
 - **stale `policy_version` or undiscoverable corpus cannot cancel** → same generic 404.
 - **cancel of a `completed` run → 200, no-op (status stays `completed`).**
 - cancel is idempotent (re-cancel of `aborted` → 200 `already_aborted`).
-- complete/cancel race yields a single, legal terminal status (CAS under `BEGIN IMMEDIATE`).
-- after cancel, zero NEW Judge/Model calls (fault service proves it).
+- complete/cancel race yields a single, legal terminal status (bidirectional CAS under
+  `BEGIN IMMEDIATE`, see §4).
+- after cancel, **zero NEW** Judge/Model calls (fault service proves it); an already-
+  entered round-0 Retriever may return exactly once and is discarded (Scenario B).
 - `aborted` state survives restart and is NOT resumable (E-023 `resume_run` refuses).
 - `cancel_run_checkpoint` invariant tests: `running_to_aborted` / `already_aborted` /
   `already_completed` / `not_found` / `CheckpointIdentityConflict`.
+- **Bidirectional complete/cancel race tests (R2-P1-3):** using the SQL `WHERE
+  status='running'` guards under `BEGIN IMMEDIATE`:
+  - cancel acquires the txn first → `aborted`; a subsequent stale `complete_run_checkpoint`
+    is a no-op (status stays `aborted`);
+  - complete acquires the txn first → `completed`; a subsequent stale
+    `cancel_run_checkpoint` is a no-op (status stays `completed`);
+  - cancel commits, then OLD execution flow tries complete → no-op (`already_aborted`);
+  - complete commits, then client tries cancel → no-op (`already_completed`).
+  In every case the final status is a single legal value, never both `aborted` and
+  `completed`.
 
 ### Backup / restore
 - consistent backup of BOTH the Metadata DB and the Evidence Snapshot Store taken under
-  concurrent writes.
-- manifest + per-file checksum correct and verifiable.
-- tampered backup (any file checksum mismatch) is rejected; live DBs untouched.
+  concurrent retrieval/audit writes, coordinated by the `BackupCoordinator` barrier so
+  both files share one `snapshot_epoch` (NOT independently-timed consistent files).
+- manifest carries per-file sha256 + the Evidence schema version/fingerprint; both
+  verifiable.
+- tampered backup (any file checksum or schema-version mismatch) is rejected; live DBs
+  untouched.
 - restore to fresh DBs yields identical documents / ACLs / checkpoints / active collection
-  pointer / evidence snapshots / evidence audit log.
+  pointer / evidence snapshots / evidence audit log, all at the same `snapshot_epoch`.
 - restore failure preserves the old DBs.
 - after restore, the `Reconciler` can rebuild a missing Qdrant/Parent-Store data plane.
 - readiness passes after restore.
@@ -358,22 +457,43 @@ uv run mypy src/agentic_rag_enterprise
   health + runs routers.
 - `src/agentic_rag_enterprise/api/dependencies.py` (edit) — provide `get_security_context`
   reuse for the cancel route.
-- `src/agentic_rag_enterprise/storage/metadata_store.py` (edit) — add
-  `cancel_run_checkpoint(run_id, tenant_id, user_id, session_id, policy_version)` (the
-  atomic CAS method, P1-3) under `BEGIN IMMEDIATE`.
-- `src/agentic_rag_enterprise/services/chat_service.py` (edit) — `cancel_run` delegating
-  to `cancel_run_checkpoint`; pre-round-0 minimal `running` checkpoint (P1-2); cooperative
-  cancellation check before each retrieval (incl. round-0) / judge / synthesis.
-- `src/agentic_rag_enterprise/services/container.py` (edit) — wire `EvidenceSnapshotStore`
-  into the default container (so its path is known and shared) and pass it to the service
-  where needed; expose it for backup.
-- `src/agentic_rag_enterprise/operations/backup.py` (new) — multi-file backup/restore CLI
-  (metadata.db + evidence.db + manifest).
+- `src/agentic_rag_enterprise/storage/metadata_store.py` (edit) — add BOTH transactional
+  CAS methods under `BEGIN IMMEDIATE` (R2-P1-3):
+  `cancel_run_checkpoint(run_id, tenant_id, user_id, session_id, policy_version)` and
+  `complete_run_checkpoint(run_id)` (replaces the unconditional `mark_run_checkpoint_done`
+  UPDATE; all iteration terminal paths use it).
+- `src/agentic_rag_enterprise/storage/evidence_store.py` (edit, R2-P1-4) — expose a safe
+  backup lock / `EVIDENCE_SCHEMA_VERSION` (or schema-version table / DDL fingerprint) and
+  a backup primitive usable by the `BackupCoordinator`.
+- `src/agentic_rag_enterprise/services/chat_service.py` (edit) — `cancel_run` +
+  `complete_run_checkpoint` delegation; pre-round-0 minimal `running` checkpoint (P1-2);
+  `resume_run` FIRST branches on `status` then narrows `first_result` per the R2-P1-1
+  table (assert is removed for `first_result=None`); cooperative cancellation check before
+  each retrieval (incl. round-0) / judge / synthesis.
+- `src/agentic_rag_enterprise/services/container.py` (edit, P2) — add `evidence_db_path`
+  param; construct `EvidenceSnapshotStore` from it; pass it to the service / expose it for
+  backup; `DefaultServiceContainer(metadata_db_path=None, evidence_db_path=None)` and
+  `reset_default_container(metadata_db_path=None, evidence_db_path=None)`.
+- `src/agentic_rag_enterprise/config.py` (edit, P2) — add `evidence_db_path: str =
+  "evidence.db"`; CLI/backup read both `metadata_db_path` and `evidence_db_path`.
+- `.env.example` (edit, P2) — document `EVIDENCE_DB_PATH`.
+- `src/agentic_rag_enterprise/operations/__init__.py` (new, P2) — package init for the
+  `operations` CLI namespace.
+- `src/agentic_rag_enterprise/operations/backup.py` (new) — `BackupCoordinator` (cross-file
+  barrier + `snapshot_epoch`) + `backup` subcommand.
+- `src/agentic_rag_enterprise/operations/restore.py` (new, P2) — `restore` subcommand
+  (manifest/checksum/schema-version verify, pre-restore backup, reconciler, readiness).
 - `src/agentic_rag_enterprise/api/schemas.py` — no `action` field on `ChatRequest` (cancel
   is a dedicated endpoint, P1-4); `ChatRequest` stays `query`+`corpus_id`+`run_id`+`resume`.
 - `docs/operations.md`, `docs/runbooks/*.md` (new).
-- `tests/unit/test_health_readiness.py` (incl. legacy `/health` regression +
-  `ready`-fails-on-missing-collection / empty-DB-ready), `tests/unit/test_cancellation.py`
-  (CAS invariants + completed/stale-policy/undiscoverable cases), `tests/unit/test_backup_restore.py`
-  (multi-file manifest/checksum/tamper), `tests/integration/test_e024_runtime_hardening.py`
+- **Test DB hygiene (P2):** every test must use a PAIR of hermetic temp paths
+  (`metadata_db_path`, `evidence_db_path`) so containers never share a root-dir
+  `evidence.db`; `reset_default_container` is called with both.
+- `tests/unit/test_health_readiness.py` (incl. legacy `/health` regression,
+  frozen-readiness-rule cases: registry-read-fail→503 / empty-profile→ready /
+  missing-pointer→503 / missing-collection→503), `tests/unit/test_cancellation.py`
+  (CAS invariants + bidirectional race + completed/stale-policy/undiscoverable + pre-
+  round-0 state-machine A/B scenarios), `tests/unit/test_backup_restore.py`
+  (multi-file manifest/checksum/`snapshot_epoch`/evidence-schema-version/tamper + barrier
+  under concurrent writes), `tests/integration/test_e024_runtime_hardening.py`
   (incl. blocking round-0 Retriever + concurrent cancel).
