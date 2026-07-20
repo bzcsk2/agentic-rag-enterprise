@@ -1,12 +1,16 @@
 # Issue E-023 — Persistent checkpoint + re-authorization on resume
 
 **Milestone:** M7 — Runtime hardening (`E-022` → `E-024`)
-**Status:** contract open — implementation pending. Acceptance of this doc unlocks
-`storage/checkpoint_store.py`, the `run_checkpoints` table + migration, the
-resumable loop in `services/chat_service.py` (`answer_with_iteration` checkpointing
-+ `resume_run`), and the `tests/.../test_e023_*` suites.
+**Status:** CLOSED / ACCEPTED at `a1cd282` (independent acceptance re-audit PASSED:
+799 passed / 1 skipped, ruff + `ruff format --check` + mypy clean). The contract
+unlocked `storage/checkpoint_store.py`, the `run_checkpoints` table + migration
+(`013_e023_run_checkpoints.sql`), the resumable loop in `services/chat_service.py`
+(`answer_with_iteration` checkpointing + `resume_run`), the `api/` resume surface,
+and the `tests/.../test_e023_*` suites.
 **Baseline:** `e06e5b1` (main HEAD; M6 CLOSED; M7 / E-022 CLOSED / ACCEPTED at
-`cd4ddb2`; E-023 current).
+`cd4ddb2`; E-023 current). **Accepted at:** `a1cd282` (HEAD — E-023 closing commit
+includes the `aborted` non-resumable regression test; full implementation across
+`5b13c30` → `a1cd282`).
 **Build plan refs:** Milestone 7 (§3619 / §3621 / §3623 — exit gate: "重启恢复重新授权；ACL
 收紧不因旧 Cache/Checkpoint 泄露"), §2988 (M7 restart before Research MVP must not
 still rely on in-process-only state), §5080 (M7 / E-023 scope), §844 / §4195–§4201

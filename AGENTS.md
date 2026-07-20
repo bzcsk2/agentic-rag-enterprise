@@ -4,8 +4,8 @@
 `docs/agentic-rag-enterprise-build-plan.md`
 
 ## Current Milestone & Issue
-- Milestone: **M7** — Runtime hardening (`E-022` → `E-024`); M6 / E-021 **CLOSED / ACCEPTED at `c6c3e6b`**; **M7 / E-022** **CLOSED / ACCEPTED at `cd4ddb2`**
-- Current Issue: **E-023** — Persistent Checkpoint + re-authorization on resume (build plan Milestone 7)
+- Milestone: **M7** — Runtime hardening (`E-022` → `E-024`); M6 / E-021 **CLOSED / ACCEPTED at `c6c3e6b`**; **M7 / E-022** **CLOSED / ACCEPTED at `cd4ddb2`**; **M7 / E-023** **CLOSED / ACCEPTED at `a1cd282`**
+- Current Issue: **E-024** — Health/readiness, persistent cancellation, backup/restore + runbooks (build plan Milestone 7)
 - Issue: **E-017** — Typed `QueryPlan` / `PlanStep` contract + DAG Validator — **CLOSED /
   ACCEPTED at `398f059`** (acceptance re-audit `33c...` passed: 10-check independent
   re-verification — schema invariants, DAG integrity for required+optional edges, binding
@@ -206,12 +206,20 @@
   the persisted truth (`registry_mismatch`). Gates at acceptance: **766 passed / 1 skipped**, ruff
   check + `ruff format --check` clean, mypy clean. Full contract at `docs/issue-e022-contract.md`.
 - Issue: **E-023** — Persistent checkpoint + re-authorization on resume (build plan
-  Milestone 7) — **CONTRACT OPEN** (implementation pending). Checkpoints the
+  Milestone 7) — **CLOSED / ACCEPTED at `a1cd282`**. Checkpoints the
   `answer_with_iteration` loop to a `run_checkpoints` table on the Metadata DB and
   re-authorizes on resume against current ACLs/active version/corpus discoverability
   (fail closed: drops any evidence the principal can no longer read; refuses
-  cross-principal / stale-`policy_version` / undiscoverable-corpus resume). Full
-  contract at `docs/issue-e023-contract.md`. E-024 remains OPEN within M7.
+  cross-principal / stale-`policy_version` / undiscoverable-corpus resume). Independent
+  acceptance re-audit (commit `a1cd282`) confirmed all five hard invariants: checkpoint
+  persistence + cross-process survival (test `test_checkpoint_persists_across_process_restart`),
+  per-round persistence + terminal-before-completed state machine, immutable `run_id`
+  identity binding (`CheckpointIdentityConflict`), resume re-auth dropping revoked
+  evidence without leak (`resume_evidence_revoked` finding), `completed` idempotent
+  zero-call resume, partial/all-evidence revocation recompute, and `aborted` non-resumable
+  (test `test_aborted_checkpoint_is_not_resumable`). Full suite **799 passed / 1 skipped**,
+  ruff + `ruff format --check` + mypy clean. Full contract at `docs/issue-e023-contract.md`.
+  E-024 is the OPEN issue within M7.
 - Issue: **E-007** — Port parent-child chunking + hybrid retrieval from upstream (algorithm only, enterprise security envelope) — CLOSED at `ccb52dc`.
 - Issue: **E-007.1** — Audit-remediation of E-007 (5 P1 + 4 P2 findings) — CLOSED at `b0dbf6f`.
 - Issue: **E-008** — Implement idempotent ingestion job and active-version protocol (M1) — CLOSED at `139df74`.

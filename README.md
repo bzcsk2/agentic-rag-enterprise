@@ -37,8 +37,55 @@ Root Orchestrator
 Auditable Answer + Citations + Trace
 ```
 
-## Core capabilities
+## Development status
 
+This repository is **not** a scaffold. It implements the enterprise Agentic RAG runtime
+end-to-end for a local (in-process) Internal / Research MVP. The current milestone is
+**M7 — Runtime hardening**, and the following issues are **CLOSED / ACCEPTED**:
+
+- **E-011** — Evidence snapshot store + required dedup (current-policy re-auth)
+- **E-012** — Single-corpus Fast Path + one-pass sufficiency decision
+- **E-013** — AnswerEnvelope, citation rendering, claim verification, conservative refusal
+- **E-014** — Shared chat service, synchronous `POST /v1/chat`, minimal Gradio adapter
+- **E-015 / E-016** — Multi-corpus registry, permission-aware router, cross-corpus merge/dedup
+- **E-017** — Typed `QueryPlan` / `PlanStep` contract + DAG Validator
+- **E-018** — Controlled Executor + dependent multi-hop (`RetrieverTool`)
+- **E-019 / E-020** — Required-Fact Coverage judge + explicit state transitions; bounded gap
+  retrieval + `no_new_evidence` stop policy
+- **E-021** — Temporal scope, source authority & conflict resolution
+- **E-022** — Reconciler + purge + index migration + rollback
+- **E-023** — Persistent checkpoint + re-authorization on resume (cross-process recoverable,
+  fail-closed ACL re-auth, `completed` idempotent, `aborted` non-resumable)
+
+**Open within M7:** **E-024** — Health/readiness, persistent cancellation, backup/restore +
+runbooks. See `docs/issue-e024-contract.md`.
+
+### Delivered capabilities (Internal MVP)
+
+- Corpus / capability registry with permission-safe discoverability.
+- Idempotent ingestion job + active-version protocol (Metadata DB = control-plane source
+  of truth).
+- Parent-child chunking + hybrid (dense+sparse) retrieval with second-authorization.
+- Single-pass Fast Path and bounded, gap-driven iteration loop with deterministic
+  coverage judge and conservative refusal (fail-closed: dependency faults never become
+  "no answer").
+- Planner DAG validation + controlled executor with atomic tool budget (multi-hop).
+- Temporal filtering + conflict resolution feeding explicit answer states
+  (`sufficient` / `contradicted` / `partial` / `abstained`).
+- Persistent run checkpoint + resume re-authorization (E-023).
+- Reconciler for orphan purge / data-plane rebuild / index rollback (E-022).
+
+### Known limitations (by design, pre-M9)
+
+- Local SQLite (Metadata DB) + in-process/local Qdrant only — **no Postgres, no Qdrant
+  Server, no SSO, no distributed scheduler** (those are M9).
+- Reconciler / checkpoint are single-process; a restart that loses a non-file-backed
+  temp DB loses in-flight checkpoints (the default container uses a stable file).
+- Local backup is **unencrypted** (no approved encryption dependency); see E-024.
+- No `/health` or `/ready` endpoint, no cancellation API, and no backup/restore tooling
+  until E-024 ships.
+
+## Core capabilities
 - **Corpus Registry**: structured descriptions, ownership, metadata, and ACL boundaries for each enterprise knowledge source.
 - **Planner / Router**: decomposes user questions and routes subqueries to the right corpora.
 - **Hybrid Retrieval**: dense + sparse retrieval with metadata filtering and reranking hooks.
@@ -83,18 +130,6 @@ Run the API service:
 ```bash
 uvicorn agentic_rag_enterprise.api.main:app --reload
 ```
-
-## Development status
-
-This repository is currently a scaffold for the enterprise Agentic RAG runtime. The first milestone is to implement a minimal loop:
-
-1. register corpora;
-2. plan a question;
-3. route subqueries;
-4. retrieve evidence;
-5. judge sufficient context;
-6. synthesize a grounded answer;
-7. record trace and evaluation artifacts.
 
 ## Design principle
 
